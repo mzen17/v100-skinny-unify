@@ -237,7 +237,11 @@ favour them by more than 5%.
 ## Quick start
 
 Requires 4× SM70 GPUs, CUDA 12.8+, and the
-[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) 1.2.2 wheel. The bootstrap
+[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) 1.2.2 wheel. The bootstrap also
+**rebuilds `flash_attn_v100` from upstream source with a local patch** (see
+[FP8 KV cache](#fp8-kv-cache-and-long-context) below); that step needs `git` and
+a working `nvcc`, takes roughly ten minutes, and can be skipped with
+`SKINNY_SKIP_FA_PATCH=1`. The bootstrap
 pins **`tilelang==0.1.10` and `apache-tvm-ffi==0.1.10`** together. Earlier
 tilelang does not build on Volta and fails later inside GDN attention where it
 looks like a kernel bug; and tilelang does not pin its own `apache-tvm-ffi`,
@@ -262,6 +266,43 @@ hf download RadixArk/Qwen3.8-27B-NVFP4 \
 
 bash scripts/serve-qwen38-native.sh ./Qwen3.8-27B-NVFP4
 ```
+
+### FP8 KV cache and long context
+
+`KVDT=fp8` serves the checkpoint's own **E4M3** KV cache instead of resolving to
+FP16. That halves KV bytes per token, which is what lets a **64k window** fit on
+a 16 GB card:
+
+```bash
+KVDT=fp8 MML=65536 GMU=0.92 K=3 bash scripts/serve-qwen38-native.sh ./Qwen3.8-27B-NVFP4
+```
+
+This depends on the patched kernel the bootstrap builds. Stock `flash_attn_v100`
+admits only fp16 and E5M2 to its XQA decode path and FP8 prefill bridge, because
+E5M2→fp16 is a pure bit shift while E4M3 needs an exponent rebias. An E4M3 cache
+therefore falls onto `scalar_paged` decode and the slow prefill. `kernel_patches/`
+adds a packed E4M3 decoder (verified exact over all 256 byte patterns) and folds
+the resulting `2^-8` into the K/V scales. Measured at a 54,054-token prompt,
+k=3, TP=2:
+
+| | stock kernel | patched |
+|---|--:|--:|
+| TTFT | 148.1 s | **60.0 s** |
+| prefill | 365 tok/s | **902 tok/s** |
+| decode | 22.2 tok/s | **50.4 tok/s** |
+
+Output is unchanged: 100% top-1 agreement and byte-identical greedy
+continuations against the unpatched E4M3 path (mean KL 8.2e-06 nats).
+
+Boot gates 5–6 adapt to the arm — on `KVDT=fp8` they assert the dtype was served
+as requested and that it is E4M3 — while gates 7–8 (`zero scalar_paged`, `XQA
+active`) stay armed for both arms, so an FP8 boot that lost the tensor-core path
+fails loudly instead of running quietly slow.
+
+**Do not use `fp8_e5m2`.** It reaches the same fast paths, but this fork forces
+*unit* KV scales for E5M2 on a quantized checkpoint, discarding the calibrated
+ones: measured mean KL **0.23 nats**, 8% of tokens changing, and reasoning traces
+25% longer — a net slowdown in time-to-answer despite the higher tok/s.
 
 Supplying your own `VLLM_WHEEL` requires `VLLM_WHEEL_SHA256` with it — the
 bootstrap fails closed on an unverified wheel rather than installing it. The

@@ -169,41 +169,11 @@ SP="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 [ -d "$SP/vllm" ] || die "vllm did not install into $SP"
 say "site-packages: $SP"
 
-# ------------------------------------------------------------- fork patches
-say "deploying fork patches"
-deploy() {
-  local src="$REPO_ROOT/fork_patches/$1" dst="$SP/$2"
-  [ -f "$src" ] || die "missing tracked patch: $src"
-  [ -f "$dst" ] || die "install path not found (wheel version mismatch?): $dst"
-  [ -f "$dst.pre_bootstrap" ] || cp -p "$dst" "$dst.pre_bootstrap"
-  cp -p "$src" "$dst"
-  echo "    $1 -> $2"
-}
-deploy gdn_attn.py          vllm/v1/attention/backends/gdn_attn.py
-deploy gpu_model_runner.py  vllm/v1/worker/gpu_model_runner.py
-deploy marlin.py            vllm/model_executor/kernels/linear/nvfp4/marlin.py
-deploy modelopt.py          vllm/model_executor/layers/quantization/modelopt.py
-deploy torch_utils.py       vllm/utils/torch_utils.py
-deploy attention.py         vllm/model_executor/layers/attention/attention.py
-deploy custom_all_reduce.py vllm/distributed/device_communicators/custom_all_reduce.py
-
-# ------------------------------------------------------------------ kernels
-KERNEL_SRC="$REPO_ROOT/kernels/skinny_kernels.cu"
-[ -f "$KERNEL_SRC" ] || die "kernel source missing: $KERNEL_SRC"
-say "warming the skinny-kernel JIT build (first build takes a few minutes)"
-CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$NVCC")")}" \
-VLLM_SKINNY_NVFP4_SRC="$KERNEL_SRC" TORCH_CUDA_ARCH_LIST=7.0 "$PY" - <<'PYEOF'
-import sys
-from vllm.model_executor.kernels.linear.nvfp4.marlin import _get_skinny_ext
-mod = _get_skinny_ext()
-if mod is None:
-    sys.exit("skinny extension failed to build (see nvcc output above)")
-missing = [f for f in ("gemm_qpn2", "gemm_qpn8", "gemm_qpn8_mt2")
-           if not hasattr(mod, f)]
-if missing:
-    sys.exit(f"kernel built but missing entry points: {missing}")
-print("    kernels built and all entry points present")
-PYEOF
+# ---------------------------------------------- fork patches + kernels
+# Shared with skinny.sh; see scripts/lib-install.sh.
+# shellcheck source=scripts/lib-install.sh
+. "$REPO_ROOT/scripts/lib-install.sh"
+skinny_install_stack
 
 cat <<EOF
 

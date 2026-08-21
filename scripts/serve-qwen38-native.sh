@@ -33,8 +33,24 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CKPT="${1:-}"
-[ -n "$CKPT" ] || { echo "usage: $0 <checkpoint-dir>" >&2; exit 2; }
+# --open binds every interface instead of loopback. It is the single explicit
+# act that acknowledges this server has NO authentication -- see the HOST block
+# below. Anything else is treated as the checkpoint directory.
+OPEN=0
+CKPT=""
+for arg in "$@"; do
+  case "$arg" in
+    --open) OPEN=1 ;;
+    -h|--help)
+      echo "usage: $0 [--open] <checkpoint-dir>" >&2
+      echo "  --open   bind 0.0.0.0 instead of 127.0.0.1 (UNAUTHENTICATED)" >&2
+      exit 0 ;;
+    -*) echo "ERROR: unknown option '$arg'" >&2; exit 2 ;;
+    *)  [ -z "$CKPT" ] || { echo "ERROR: more than one checkpoint given" >&2; exit 2; }
+        CKPT="$arg" ;;
+  esac
+done
+[ -n "$CKPT" ] || { echo "usage: $0 [--open] <checkpoint-dir>" >&2; exit 2; }
 [ -f "$CKPT/config.json" ] || { echo "ERROR: no config.json in $CKPT" >&2; exit 2; }
 CKPT="$(cd "$CKPT" && pwd)"
 
@@ -51,14 +67,16 @@ fi
   echo "ERROR: vllm is not importable from $PY" >&2
   echo "       run scripts/bootstrap-sm70.sh with this environment active" >&2; exit 2; }
 
-K="${K:-7}"; K1=$((K + 1)); K2=$((K1 * 2))
+# k=3, not 7: with the 64k window below this is long-context serving, where
+# k=3 is the documented profile (see "Depth profiles" in the README).
+K="${K:-3}"; K1=$((K + 1)); K2=$((K1 * 2))
 # Bind to loopback by default. This server has NO authentication: anything that
 # can reach the port can use the model, read any prompt in flight, and drive
 # the box. Exposing it is a deliberate act, so it needs an explicit HOST and an
 # acknowledgement -- and even then it belongs behind a firewall or a proxy that
 # terminates auth. vLLM's own security guidance is that its API keys do not
 # protect every endpoint.
-HOST="${HOST:-127.0.0.1}"
+if [ "$OPEN" = 1 ]; then HOST="${HOST:-0.0.0.0}"; else HOST="${HOST:-127.0.0.1}"; fi
 # Probe the address we actually bound. A fixed 127.0.0.1 probe silently times
 # out under HOST=::1, and 0.0.0.0 is not a connect address at all.
 case "$HOST" in
@@ -70,19 +88,61 @@ esac
 case "$HOST" in
   127.0.0.1|localhost|::1) ;;
   *)
-    [ "${I_UNDERSTAND_THIS_IS_UNAUTHENTICATED:-0}" = 1 ] || {
+    [ "$OPEN" = 1 ] || [ "${I_UNDERSTAND_THIS_IS_UNAUTHENTICATED:-0}" = 1 ] || {
       echo "REFUSING to bind $HOST: this server is unauthenticated." >&2
       echo "  Keep the default (127.0.0.1) and use an SSH tunnel:" >&2
       echo "    ssh -N -L 8000:127.0.0.1:8000 <user>@<host>" >&2
       echo "  Or, if you really intend to expose it on a trusted network:" >&2
-      echo "    HOST=$HOST I_UNDERSTAND_THIS_IS_UNAUTHENTICATED=1 $0 ..." >&2
+      echo "    $0 --open <checkpoint-dir>" >&2
       exit 2; }
     echo "==> WARNING: binding $HOST with no authentication. Firewall this." >&2 ;;
 esac
 # GMU 0.88, not the 0.93 of the all-NVFP4 profile: verbatim mixed FP8+NVFP4
 # weights alongside an fp16 KV cache do not fit at 0.93 on 16 GB cards.
-GMU="${GMU:-0.88}"
-MML="${MML:-32768}"
+# KV cache dtype. Default "auto", which this fork resolves to FP16 on SM70 by
+# declining the checkpoint's FP8-KV directive (see fork_patches/torch_utils.py).
+#
+# KVDT=fp8 selects the checkpoint's own E4M3 KV cache. That halves KV bytes per
+# token, which is what makes a 64k window fit on a 16 GB card -- and with the
+# rebuilt kernel from kernel_patches/ it keeps the tensor-core XQA decode path
+# and the FP8 prefill bridge, so it costs nothing in quality (verified
+# byte-identical output). WITHOUT that rebuilt kernel it silently falls onto
+# scalar_paged decode and the slow prefill: 54k prompt goes 60 s -> 148 s TTFT.
+# Gate 5/6 below adapt to the arm; gates 7/8 are asserted either way.
+#
+# Do NOT use fp8_e5m2 here: it reaches the same fast paths, but this fork forces
+# UNIT KV scales for e5m2 on a quantized checkpoint, discarding the calibrated
+# ones (measured mean KL 0.23 nats and +25% reasoning-trace length).
+KVDT="${KVDT:-fp8}"
+
+# Multimodal. This checkpoint is genuinely multimodal -- 333 vision tensors, a
+# 27-layer tower -- and it reads images correctly on Volta. Images are enabled
+# by default at a 1-megapixel ceiling.
+#
+# The ceiling is load-bearing, not cosmetic. The processor's own default is
+# 16.7 MP, and vLLM sizes its memory profile against the LARGEST permitted
+# image, so leaving it uncapped reserves ~0.8 GiB that never gets used and
+# costs more KV than the vision weights themselves:
+#
+#     images off ............ 129,901 KV tokens   (1.98x concurrency at 64k)
+#     images on, 1 MP cap ... 107,666             (1.64x)
+#     images on, uncapped ....  72,557            (1.11x)
+#
+# Long-context speed is unaffected either way (54k prompt: 61.1 s vs 60.0 s
+# TTFT). Oversized images are downscaled to the cap, not rejected.
+#
+# Set MM_LIMIT='{"image":0,"video":0}' for a text-only server; that is the
+# configuration the published throughput numbers were measured on.
+MM_LIMIT="${MM_LIMIT:-{\"image\":1,\"video\":0\}}"
+MM_PIXELS="${MM_PIXELS:-1048576}"
+# 0.92, not 0.88: FP8 KV needs the extra budget to hold a 64k window. This
+# box's usable range is narrow and non-monotonic -- 0.90 boots and then OOMs
+# on the first prefill, 0.93 dies in CUDA-graph capture. Lower it to 0.88 if
+# you drop back to FP16 KV (KVDT=auto), which needs far less headroom.
+GMU="${GMU:-0.92}"
+# 64k. Only reachable with KVDT=fp8; FP16 KV tops out near 40k on a 16 GB
+# card. Declared context is free -- see the README.
+MML="${MML:-65536}"
 MNS="${MNS:-1}"
 MBT="${MBT:-4096}"
 PORT="${PORT:-8000}"
@@ -145,6 +205,20 @@ rm -f "$LOG"
 # teacher-forced KL divergence over 346 positions of mean 3.96e-06 nats with
 # 100% top-1 agreement -- fp reassociation noise, not a behavioural change.
 # Scope: this enables ONE op by name. The blanket 'none' still governs the rest.
+# Only pass processor kwargs when images are actually enabled; an empty
+# expansion keeps the text-only command line byte-identical to before.
+case "$MM_LIMIT" in
+  *'"image":0'*) MM_PROC_ARGS="" ;;
+  *) MM_PROC_ARGS="--mm-processor-kwargs {\"size\":{\"longest_edge\":$MM_PIXELS,\"shortest_edge\":65536}}" ;;
+esac
+
+# Tool calling uses qwen3_coder, not hermes. This model emits Qwen's XML
+# tool-call format; the hermes parser does not recognise it, so requests
+# still succeed but `tool_calls` comes back empty -- a silent failure.
+# QPN_UNIFY=1 skips building the Marlin repack for QPN-eligible layers, saving
+# one resident copy of every NVFP4 weight. Required on 16 GB cards -- without
+# it the loader holds both the repack and the qpn buffer and OOMs during model
+# load. Harmless on larger cards. Set VLLM_SKINNY_QPN_UNIFY=0 to opt out.
 echo "==> serving $CKPT  (k=$K, GMU=$GMU, MML=$MML, partition=$DECODE_PARTITION)"
 echo "==> interpreter: $PY"
 
@@ -160,6 +234,7 @@ VLLM_SKINNY_QPN2=1 \
 VLLM_SKINNY_LMHEAD=1 \
 VLLM_SKINNY_LMHEAD_NATIVE=1 \
 VLLM_SKINNY_DROP_CT=1 \
+VLLM_SKINNY_QPN_UNIFY="${VLLM_SKINNY_QPN_UNIFY:-1}" \
 VLLM_SKINNY_NVFP4_SRC="$REPO_ROOT/kernels/skinny_kernels.cu" \
 VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT=0 \
 VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD=1 \
@@ -174,12 +249,14 @@ setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --tensor-parallel-size "$TP"  \
   --gpu-memory-utilization "$GMU" \
   --max-model-len "$MML" \
+  --kv-cache-dtype "$KVDT" \
   --max-num-seqs "$MNS" \
   --max-num-batched-tokens "$MBT" \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --limit-mm-per-prompt "$MM_LIMIT" \
+  ${MM_PROC_ARGS} \
   --default-chat-template-kwargs "{\"enable_thinking\":$THINKING}" \
   --reasoning-parser qwen3 \
-  --enable-auto-tool-choice --tool-call-parser hermes \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2],\"custom_ops\":[\"none\",\"+rms_norm_gated\"]}" \
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"draft_sample_method\":\"greedy\",\"use_local_argmax_reduction\":true}" \
   --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
@@ -246,13 +323,29 @@ grep -q "falling back to requant pack\|packing from the model's own weights" "$L
 # was selected before the loader fix. The load-bearing witness is the loader
 # explicitly DECLINING the directive.
 KVD=$(grep -o "kv_cache_dtype=[a-z0-9_]*" "$LOG" | head -1 | cut -d= -f2)
-[ "${KVD:-auto}" = "auto" ] && gate "kv_cache_dtype == auto" ok \
-  || gate "kv_cache_dtype == auto" fail "got '$KVD' — checkpoint KV directive was honoured"
+if [ "$KVDT" = "auto" ]; then
+  [ "${KVD:-auto}" = "auto" ] && gate "kv_cache_dtype == auto" ok \
+    || gate "kv_cache_dtype == auto" fail "got '$KVD' — checkpoint KV directive was honoured"
 
-grep -q "Ignoring the checkpoint's kv_cache quantization directive" "$LOG" \
-  && gate "FP16 KV resolved (checkpoint FP8-KV directive declined)" ok \
-  || gate "FP16 KV resolved (checkpoint FP8-KV directive declined)" fail \
-       "no decline line — KV storage is NOT proven FP16"
+  grep -q "Ignoring the checkpoint's kv_cache quantization directive" "$LOG" \
+    && gate "FP16 KV resolved (checkpoint FP8-KV directive declined)" ok \
+    || gate "FP16 KV resolved (checkpoint FP8-KV directive declined)" fail \
+         "no decline line — KV storage is NOT proven FP16"
+else
+  # FP8-KV arm: the request was explicit, so assert it was SERVED as asked
+  # rather than asserting the decline. The fast-path gates below are NOT
+  # relaxed -- an FP8 arm that lost XQA is exactly the failure worth catching,
+  # and it is what an unpatched flash_attn_v100 produces.
+  [ "${KVD:-}" = "$KVDT" ] && gate "kv_cache_dtype == $KVDT (explicit)" ok \
+    || gate "kv_cache_dtype == $KVDT (explicit)" fail "log says '${KVD:-<none>}'"
+  case "$KVDT" in
+    fp8|fp8_e4m3)
+      gate "E4M3 KV keeps the checkpoint's calibrated scales" ok ;;
+    *)
+      gate "E4M3 KV keeps the checkpoint's calibrated scales" fail \
+        "KVDT=$KVDT is not E4M3; e5m2 discards calibrated KV scales" ;;
+  esac
+fi
 
 # Honouring the FP8-KV directive on SM70 silently drops decode onto the scalar
 # paged route and costs 4.82 ms/round. Zero is the only acceptable count.
@@ -271,6 +364,16 @@ fi
 # `route=qpn*` matches a QPN8 line, so on its own it does NOT prove the NVFP4
 # trunk/lm_head went through QPN2. NVFP4 dispatch is logged as "-> qpn2" in the
 # route map, a different spelling entirely. Prove each side with its own witness.
+# An image-enabled boot that silently loaded no vision tower would accept
+# requests and then fail on the first image, so prove the encoder initialised.
+case "$MM_LIMIT" in
+  *'"image":0'*) ;;
+  *)
+    grep -q "MMEncoderAttention" "$LOG" \
+      && gate "vision encoder initialised (images at ${MM_PIXELS}px cap)" ok \
+      || gate "vision encoder initialised" fail "no MMEncoderAttention line" ;;
+esac
+
 grep -qE "route map: M=[0-9]+ N=[0-9]+ K=[0-9]+ -> qpn2" "$LOG" \
   && gate "QPN2 dispatched (NVFP4 trunk/lm_head)" ok \
   || gate "QPN2 dispatched (NVFP4 trunk/lm_head)" fail "no '-> qpn2' route-map line"

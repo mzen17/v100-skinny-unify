@@ -14,3 +14,13 @@ dist/
 *.so
 .venv-sm70
 Qwen3.8*
+
+# Upstream source checked out for the kernel rebuild (scripts/lib-install.sh).
+# A nested git repo -- never commit it. The reviewable artifact is the diff in
+# kernel_patches/, applied to a pinned upstream commit.
+vendor/1Cat-vLLM/
+vendor/flash_attn_v100.installed.bak/
+.cache/
+
+# Serve-time scratch
+serve.pid
