@@ -80,6 +80,51 @@ def _qpn2_cfg(k: int, n: int):
         if (k // 16) % s == 0:
             return (s, 2 if s >= 16 else 1)
     return None
+# Dense-recon prefill band (2026-08-20). Above _RECON_MIN_M, reconstructing
+# the dense fp16 weight from the qpn buffer and running a plain cuBLAS
+# tensor-core GEMM beats Marlin outright, because Marlin's in-register
+# dequant costs it half its tensor-core throughput (measured 45.7 vs 87.9
+# TFLOP/s on this box against a ~112 peak). Marlin still wins below the
+# crossover, where the GEMM is small enough that the O(N*K) reconstruction
+# does not amortise -- so this is an added band, not a replacement, and the
+# marlin repack stays resident exactly as before. Measured recon-vs-marlin
+# on the real per-rank trunk shapes (ms, M=512 / 4096):
+#   (K=5120,N=17408) gate/up  1.89/9.60  vs marlin 2.03/16.33  -> 1.70x
+#   (K=8704,N=5120)  down     0.92/4.36  vs marlin 1.01/ 8.70  -> 2.00x
+# The crossover sits at M=512 on every trunk shape measured; below it
+# marlin is still ahead, so the default threshold is that crossover.
+_RECON_MIN_M = int(os.environ.get("VLLM_SKINNY_RECON_MIN_M", "512"))
+# Cap the transient. The dense weight is n*k*2 bytes, alive only for the one
+# matmul; the caching allocator reuses one block across same-shaped layers,
+# so the steady-state cost is the largest single admitted transient. 256 MiB
+# admits the trunk projections (gate/up 178 MB, down 89 MB) and excludes
+# lm_head (62080x5120 = 636 MB), which would be a large spike against a
+# GMU=0.88 KV pool for a GEMM that rarely sees a prefill-scale M anyway.
+_RECON_MAX_BYTES = int(os.environ.get("VLLM_SKINNY_RECON_MAX_BYTES",
+                                      str(256 * 1024 * 1024)))
+# UNIFY has no marlin copy to fall back on, so its large-M band is a choice
+# between gemm_wmma and the same dense reconstruction. Measured wmma vs dense
+# (ms) on the trunk shapes, M=64 / 128 / 4096:
+#   (K=5120,N=17408) gate/up  1.27/1.81/32.26  vs dense 1.31/1.45/ 9.60
+#   (K=8704,N=5120)  down     0.70/1.00/16.15  vs dense 0.75/0.75/ 4.36
+# wmma is marginally ahead through M=64 and loses decisively from M=128 up,
+# so that is the crossover. gemm_wmma still serves anything the dense path
+# declines (bf16, oversized transient, graph capture).
+_UNIFY_DENSE_MIN_M = int(os.environ.get("VLLM_SKINNY_UNIFY_DENSE_MIN_M",
+                                        "128"))
+
+
+def _capturing() -> bool:
+    """True while a CUDA graph is being captured. The recon band allocates a
+    large transient per call, which must not be baked into a captured graph;
+    decode shapes are the ones that get captured and they sit far below
+    _RECON_MIN_M anyway, so declining here costs nothing."""
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
 _SELF_CHECK_CALLS = 3
 _SELF_CHECK_TOL = 3e-2
 
@@ -120,6 +165,141 @@ def _qpn_prepack(codes: torch.Tensor, scales: torch.Tensor):
                            g.view(1, groups, 1).expand(tt, groups, 32)]
     del nib
     return qc.view(-1).contiguous(), qs.view(-1).contiguous()
+
+
+def _qpn_unprepack_fast(qc: torch.Tensor, qs: torch.Tensor, n: int, k: int):
+    """CUDA-kernel unprepack when the extension has it (measured 2.4-3x
+    faster than the Python advanced-indexing version at prefill scale --
+    see benchmarks/qpn_recon_vs_marlin.py); falls back to the proven-correct
+    Python path otherwise (e.g. an extension built from an older .cu before
+    qpn_unprepack existed)."""
+    ext = _get_skinny_ext()
+    if hasattr(ext, "qpn_unprepack"):
+        codes, scales = ext.qpn_unprepack(qc, qs, n, k)
+        return codes, scales
+    return _qpn_unprepack(qc, qs, n, k)
+
+
+# UNIFY (VLLM_SKINNY_QPN_UNIFY=1): skip building the marlin-repacked copy
+# for QPN-eligible layers entirely. _qpn_prepack is a pure byte permutation
+# (proven invertible below); every M this fork doesn't have a dedicated
+# tiny-M kernel for is served by transiently reconstructing the dense
+# weight from the SAME qpn buffer and running a plain matmul, then
+# discarding it -- never persisted. Mirrors modelopt.py's
+# _sm70_qpn8_unpack-based prefill fallback for the FP8 half of the model,
+# which already does this; NVFP4/marlin never got the same treatment
+# because it needed its own 4-bit (nibble) unprepack instead of QPN8's
+# byte-level one. Net effect: one resident weight copy (qpn) instead of
+# two (qpn + marlin) for every QPN-eligible NVFP4 layer.
+_SKINNY_UNIFY = os.environ.get("VLLM_SKINNY_QPN_UNIFY", "0") == "1"
+_E2M1_MAG_TABLE: dict = {}
+
+
+def _qpn_unprepack(qc: torch.Tensor, qs: torch.Tensor, n: int, k: int):
+    """Inverse of _qpn_prepack: recovers the checkpoint-native codes/scales
+    byte-for-byte from the qpn-permuted buffer. Pure permutation, no value
+    change -- round-trip-verified offline against _qpn_prepack for every
+    NVFP4 shape in this model (MLP gate/up/down, lm_head)."""
+    dev = qc.device
+    tiles, groups = n // 32, k // 16
+    lane = torch.arange(32, device=dev)
+    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+    korder = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7,
+                           8, 10, 12, 14, 9, 11, 13, 15], device=dev)
+    g = torch.arange(groups, device=dev)
+    kidx = g.view(groups, 1) * 16 + korder.view(1, 16)
+
+    qc = qc.view(tiles, groups, 32, 8)
+    qs = qs.view(tiles, groups, 32)
+    nib_out = torch.empty(n, k, dtype=torch.uint8, device=dev)
+    scales_out = torch.empty(n, groups, dtype=torch.uint8, device=dev)
+
+    chunk = max(1, 36864 // groups)
+    for t0 in range(0, tiles, chunk):
+        t1 = min(t0 + chunk, tiles)
+        tt = t1 - t0
+        ncol = (torch.arange(t0, t1, device=dev).view(tt, 1) * 32
+                + col.view(1, 32))
+        nb_full = torch.empty(tt, groups, 32, 16, dtype=torch.uint8, device=dev)
+        nb_full[..., 0::2] = qc[t0:t1] & 0xF
+        nb_full[..., 1::2] = qc[t0:t1] >> 4
+        nib_out[ncol.view(tt, 1, 32, 1).expand(tt, groups, 32, 16),
+                kidx.view(1, groups, 1, 16).expand(tt, groups, 32, 16)] = nb_full
+        scales_out[ncol.view(tt, 1, 32).expand(tt, groups, 32),
+                   g.view(1, groups, 1).expand(tt, groups, 32)] = qs[t0:t1]
+
+    codes_out = nib_out[:, 0::2] | (nib_out[:, 1::2] << 4)
+    return codes_out.contiguous(), scales_out.contiguous()
+
+
+def _qpn_reconstruct_weight(qc: torch.Tensor, qs: torch.Tensor, n: int,
+                            k: int, gscale: float, dtype: torch.dtype):
+    """Transient dense [n,k] dequant from the qpn buffer -- built fresh for
+    one matmul and immediately freed by the caller, never persisted.
+
+    Chunked over N and computed directly in `dtype`: an earlier unchunked
+    fp32-intermediate version spiked >1GB per call at prefill-scale M
+    (e.g. N=17408,K=5120) and OOM'd a live server on its second request --
+    the memory profiler's own dummy prefill calls happened to survive it,
+    but steady-state serving (KV cache pool already claiming most "spare"
+    memory) did not. Bound every intermediate the same way _qpn_prepack
+    bounds its own gather transients at load time.
+
+    Fast path (2026-08-20): the extension's fused qpn_dequant does the whole
+    unprepack+dequant as one memory-bound kernel. The Python body below is
+    O(N*K) and, being independent of M, cost ~22 ms per call at gate/up size
+    -- flat across the entire M range, so it swamped the very GEMM it feeds
+    (Marlin serves the same shape in 16 ms at M=4096). The kernel does the
+    same work at HBM speed. Verified bit-identical to this body at
+    gscale=1.0, and within one fp16 ULP otherwise (the kernel folds gscale
+    into the group scale once instead of multiplying it in per element,
+    which is one rounding fewer, not more).
+    """
+    if dtype == torch.float16:
+        ext = _get_skinny_ext()
+        if ext is not None and hasattr(ext, "qpn_dequant"):
+            return ext.qpn_dequant(qc, qs, n, k, gscale)
+    dev = qc.device
+    key = (dev, dtype)
+    if key not in _E2M1_MAG_TABLE:
+        _E2M1_MAG_TABLE[key] = torch.tensor(
+            [0., .5, 1., 1.5, 2., 3., 4., 6.], device=dev, dtype=dtype)
+    mags = _E2M1_MAG_TABLE[key]
+    codes, scales8 = _qpn_unprepack(qc, qs, n, k)
+    sc_all = scales8.view(torch.float8_e4m3fn).to(dtype)  # [n, k//16], small
+    out = torch.empty(n, k, dtype=dtype, device=dev)
+
+    # Cap the largest per-chunk intermediate (the int64 gather index from
+    # advanced indexing) at ~48 MB, not the ~1GB+ an unchunked n*k tensor
+    # spikes to for the model's largest matrices.
+    row_chunk = max(1, (48 * 1024 * 1024) // max(k * 8, 1))
+    for r0 in range(0, n, row_chunk):
+        r1 = min(r0 + row_chunk, n)
+        c = codes[r0:r1]
+        nib = torch.stack([c & 0xF, c >> 4], dim=-1).view(r1 - r0, k)
+        mag = mags[(nib & 0x7).long()]
+        sign = torch.where(nib & 0x8 != 0, mags.new_tensor(-1.0),
+                           mags.new_tensor(1.0))
+        sc_full = sc_all[r0:r1].repeat_interleave(16, dim=1)
+        out[r0:r1] = mag * sign * sc_full * gscale
+        del nib, mag, sign, sc_full
+    return out
+
+
+def _skip_marlin_build(layer) -> None:
+    """UNIFY: drop the raw checkpoint weight instead of marlin-repacking it.
+    layer.weight/weight_scale/weight_global_scale go to empty (numel()==0
+    is how the dispatch op and apply_weights both detect "marlin was
+    skipped for this layer"); layer.workspace is a placeholder so the
+    hasattr(layer, "workspace") gate elsewhere still passes."""
+    dev = layer.weight.data.device
+    layer.weight = torch.nn.Parameter(
+        layer.weight.data.new_empty(0), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(
+        layer.weight_scale.data.new_empty(0), requires_grad=False)
+    layer.weight_global_scale = torch.nn.Parameter(
+        torch.empty(0, device=dev), requires_grad=False)
+    layer.workspace = torch.empty(0, dtype=torch.int32, device=dev)
 
 
 def _qpn_stash(layer) -> None:
@@ -215,9 +395,40 @@ def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
         and k % 128 == 0 and n % 8 == 0
     use_wmma = has_ct and (not use_qpn) and (not use_simt) \
         and m <= _SKINNY_MAX_M and k % 128 == 0 and n % 64 == 0
+    # UNIFY fallback: marlin_w is empty exactly when process_weights_after_
+    # loading skipped the marlin repack for this (qpn-eligible) layer. Every
+    # M that doesn't hit a tiny-M kernel above reconstructs the dense weight
+    # transiently from the SAME qpn buffer instead of reading a second
+    # resident copy. Never persisted -- freed the moment this call returns.
+    use_reconstruct = (marlin_w.numel() == 0 and qpn_codes.numel() > 0
+                        and not (qpn2_cfg is not None or use_qpn or use_qpn1
+                                 or use_simt or use_wmma))
+    # Dense-recon prefill band: reconstruct the fp16 weight from the qpn
+    # buffer (fused CUDA kernel, memory-bound) and hand it to cuBLAS. Only
+    # above the measured crossover, only when the transient is bounded, and
+    # never inside a graph capture. Distinct from use_reconstruct above,
+    # which is UNIFY's marlin-less fallback and owns every M when the marlin
+    # repack was skipped entirely; this one is an optimisation ON TOP of a
+    # resident marlin copy and only claims the band where it actually wins.
+    use_dense = (marlin_w.numel() > 0 and qpn_codes.numel() > 0
+                 and m >= _RECON_MIN_M
+                 and x.dtype == torch.float16
+                 and n % 32 == 0 and k % 16 == 0
+                 and (n * k * 2) <= _RECON_MAX_BYTES
+                 and not _capturing())
+    # Within UNIFY's band, pick between gemm_wmma and dense recon up front so
+    # the route map names the kernel that actually ran.
+    _u_wmma_ok = _skinny_ok and k % 256 == 0 and n % 64 == 0
+    _u_dense_ok = (x.dtype == torch.float16 and n % 32 == 0 and k % 16 == 0
+                   and not _capturing())
+    unify_dense = use_reconstruct and _u_dense_ok and (
+        not _u_wmma_ok
+        or (m >= _UNIFY_DENSE_MIN_M and (n * k * 2) <= _RECON_MAX_BYTES))
     route = "qpn2" if qpn2_cfg is not None else "qpn" if use_qpn \
         else "qpn1" if use_qpn1 \
-        else "simt" if use_simt else "wmma" if use_wmma else "marlin"
+        else "simt" if use_simt else "wmma" if use_wmma \
+        else ("recon" if unify_dense else "wmma_recon") if use_reconstruct \
+        else "recon" if use_dense else "marlin"
     # Route map: the op body runs at capture/compile/eager time, so one
     # line per unique (route, M) documents what each graph replays.
     key = (route, m, n, k)
@@ -237,6 +448,41 @@ def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
         ext = _get_skinny_ext()
         fn = ext.gemm_simt if use_simt else ext.gemm_wmma
         return fn(x, codes, scales, gscale)
+    if use_reconstruct:
+        # Recover checkpoint-native bytes (CUDA kernel, pure permutation,
+        # proven byte-identical) and hand them to the wmma tensor-core
+        # kernel, which now grid-tiles the WHOLE M range in one launch
+        # (skinny_kernels.cu:skinny_nvfp4_wmma, grid.y since 2026-08-20).
+        # An earlier version of this branch looped the M<=128 kernel from
+        # Python for M>128 -- one launch per 128-row chunk, each sweeping
+        # every N-tile, which forced a full N-sweep of unrelated weight
+        # data between two touches of the SAME N-tile's bytes and evicted
+        # it from L2 every time: measured 33.6ms at M=4096 against a naive
+        # from-HBM 32x-reread floor of 1.8ms. Grid-tiling within one launch
+        # lets L2 actually serve the repeated reads instead of guaranteeing
+        # a miss on every one of them.
+        #
+        # Above _UNIFY_DENSE_MIN_M that grid-tiled wmma kernel is itself the
+        # wrong tool: it is ~2x slower than marlin at prefill widths (32.3 vs
+        # 16.3 ms at M=4096 on gate/up), because dequantising inside the
+        # mainloop costs roughly half of Volta's tensor-core throughput. The
+        # dense path pays one memory-bound reconstruction and then runs
+        # cuBLAS at full rate, which is 1.7-2.0x faster than marlin rather
+        # than 2x slower. wmma keeps the small-M end, where it is still ahead
+        # and the transient would not amortise.
+        if _u_wmma_ok and not unify_dense:
+            ct_codes, ct_scales = _qpn_unprepack_fast(qpn_codes, qpn_scales,
+                                                       n, k)
+            return _get_skinny_ext().gemm_wmma(x, ct_codes, ct_scales, gscale)
+        w = _qpn_reconstruct_weight(qpn_codes, qpn_scales, n, k, gscale,
+                                    x.dtype)
+        return torch.nn.functional.linear(x, w)
+    if use_dense:
+        # Transient by contract: `w` dies with this frame, so the resident
+        # footprint is unchanged. See _RECON_MIN_M for the measured band.
+        w = _qpn_reconstruct_weight(qpn_codes, qpn_scales, n, k, gscale,
+                                    x.dtype)
+        return torch.nn.functional.linear(x, w)
     return apply_fp4_marlin_linear(
         input=x, weight=marlin_w, weight_scale=marlin_s,
         weight_global_scale=marlin_gs, workspace=workspace,
@@ -304,6 +550,13 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
                 "SM70 skinny NVFP4 path enabled for M<=%d (QPN %s).",
                 _SKINNY_MAX_M, "on" if _QPN_ENABLED else "off"
             )
+            if _SKINNY_UNIFY and layer.skinny_qpn_codes.numel() > 0:
+                _skip_marlin_build(layer)
+                logger.info_once(
+                    "SM70 skinny NVFP4 UNIFY: marlin repack skipped, qpn "
+                    "buffer serves every M (VLLM_SKINNY_QPN_UNIFY=1)."
+                )
+                return
         prepare_fp4_layer_for_marlin(layer)
 
     def _marlin_apply(self, layer, x, bias):
@@ -342,7 +595,8 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             y = y + bias
 
         if _self_checks_done < _SELF_CHECK_CALLS and _eager_context() \
-                and _skinny_ok and xc.shape[0] <= _SKINNY_MAX_M:
+                and _skinny_ok and xc.shape[0] <= _SKINNY_MAX_M \
+                and layer.weight.numel() > 0:
             _self_checks_done += 1
             y_ref = self._marlin_apply(layer, xc, bias)
             denom = y_ref.float().abs().max().clamp(min=1e-6)
@@ -696,6 +950,14 @@ if _SKINNY_ENABLED:
             _S._skinny_orig_apply = _S.apply_weights
             _S.apply_weights = _skinny_w4a16_apply
             logger.info_once("Skinny path hooked into W4A16 NVFP4 scheme.")
+        if (_SKINNY_UNIFY and hasattr(layer, "skinny_qpn_codes")
+                and layer.skinny_qpn_codes.numel() > 0):
+            _skip_marlin_build(layer)
+            logger.info_once(
+                "W4A16 NVFP4 UNIFY: marlin repack skipped, qpn buffer "
+                "serves every M (VLLM_SKINNY_QPN_UNIFY=1)."
+            )
+            return
         return _orig_prepare(layer, input_dtype)
 
     _mu_fp4.prepare_fp4_layer_for_marlin = _stashing_prepare

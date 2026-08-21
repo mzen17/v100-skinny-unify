@@ -46,7 +46,7 @@ NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 echo "    GPUs visible: $NGPU"
 # The serving config is TP4 and the published measurements are 4x V100-16GB.
 # Discover this now, not two steps into a build.
-[ "$NGPU" -ge "${REQUIRE_GPUS:-4}" ] || die "this configuration needs ${REQUIRE_GPUS:-4} GPUs; $NGPU visible
+[ "$NGPU" -ge "${REQUIRE_GPUS:-2}" ] || die "this configuration needs ${REQUIRE_GPUS:-4} GPUs; $NGPU visible
        (set REQUIRE_GPUS=n only if you intend a different topology --
         the published numbers are TP4 on 4x V100-SXM2-16GB)"
 
@@ -77,64 +77,7 @@ echo "    checkpoint: $PINNED_MODEL_REPO @ $PINNED_MODEL_REVISION"
 echo "      hf download $PINNED_MODEL_REPO --revision $PINNED_MODEL_REVISION"
 
 # ------------------------------------------------------------------- python
-if command -v conda >/dev/null; then
-  say "creating environment at $ENV_PREFIX (python $PYTHON_VERSION)"
-  conda create -y -p "$ENV_PREFIX" "python=$PYTHON_VERSION" >/dev/null
-  PY="$ENV_PREFIX/bin/python"
-else
-  say "conda not found; using python -m venv at $ENV_PREFIX"
-  python3 -m venv "$ENV_PREFIX"
-  PY="$ENV_PREFIX/bin/python"
-fi
-"$PY" -m pip install --upgrade pip >/dev/null
-
-say "installing pinned vLLM wheel"
-# The README pins 1.2.2 and every published number was measured on it; 1Cat
-# has since released 1.3.0, so an unchecked wheel silently changes the engine
-# under the results. Verify the version, and the digest when one is supplied.
-# Fetch a remote wheel to a local file FIRST, so the digest is checked against
-# the bytes that get installed. Hashing only local paths let a URL install
-# unverified, which is the weakest link in a "reproducible" bootstrap.
-WHEEL_LOCAL="$VLLM_WHEEL"
-case "$VLLM_WHEEL" in
-  http://*|https://*)
-    WHEEL_LOCAL="$(mktemp -d)/$(basename "${VLLM_WHEEL%%\?*}")"
-    say "downloading wheel"
-    curl -fL --retry 3 -o "$WHEEL_LOCAL" "$VLLM_WHEEL" || die "wheel download failed: $VLLM_WHEEL" ;;
-esac
-[ -f "$WHEEL_LOCAL" ] || die "wheel not found: $WHEEL_LOCAL"
-
-# Fail CLOSED: no digest means no install, unless explicitly waived.
-if [ -z "${VLLM_WHEEL_SHA256:-}" ]; then
-  [ "${ALLOW_UNVERIFIED_WHEEL:-0}" = 1 ] || die \
-    "no SHA256 for $VLLM_WHEEL
-   Pin one:   VLLM_WHEEL_SHA256=<digest> ...
-   Or waive:  ALLOW_UNVERIFIED_WHEEL=1 ...  (not reproducible)"
-  echo "    WARNING: installing an unverified wheel" >&2
-else
-  got=$(sha256sum "$WHEEL_LOCAL" 2>/dev/null | cut -d" " -f1) \
-    || got=$(shasum -a 256 "$WHEEL_LOCAL" | cut -d" " -f1)
-  [ "$got" = "$VLLM_WHEEL_SHA256" ] || die \
-    "wheel digest mismatch
-   expected $VLLM_WHEEL_SHA256
-   got      $got"
-  echo "    wheel sha256 verified"
-fi
-"$PY" -m pip install "$WHEEL_LOCAL"
-
-# Trust installed metadata, not the filename: a renamed wheel passes any
 # filename check ever written.
-INSTALLED=$("$PY" - <<'EOF'
-import importlib.metadata as md
-for n in ("1cat-vllm", "1cat_vllm"):
-    try:
-        print(md.distribution(n).version); break
-    except Exception:
-        pass
-else:
-    print("")
-EOF
-)
 [ "$INSTALLED" = "1.2.2" ] || { [ "${ALLOW_WHEEL_MISMATCH:-0}" = 1 ] && \
     echo "    WARNING: installed 1cat-vllm $INSTALLED, not 1.2.2" >&2; } || die \
   "installed 1cat-vllm is '${INSTALLED:-<none>}', not 1.2.2

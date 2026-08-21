@@ -7,6 +7,9 @@
 #
 # Overridable: ENV_PREFIX K GMU MML MNS MBT PORT DECODE_PARTITION THINKING
 #
+# By default this uses whatever python is first on PATH -- i.e. your active
+# conda env. Set ENV_PREFIX to pin a specific environment instead.
+#
 # The boot is GATED on OBSERVED EXECUTION, not on configuration strings: the
 # script refuses to report success unless the server
 # actually served the configuration asked for. Five checks, each of which has
@@ -35,9 +38,18 @@ CKPT="${1:-}"
 [ -f "$CKPT/config.json" ] || { echo "ERROR: no config.json in $CKPT" >&2; exit 2; }
 CKPT="$(cd "$CKPT" && pwd)"
 
-ENV_PREFIX="${ENV_PREFIX:-$REPO_ROOT/.venv-sm70}"
-PY="$ENV_PREFIX/bin/python"
-[ -x "$PY" ] || { echo "ERROR: no environment at $ENV_PREFIX — run scripts/bootstrap-sm70.sh first" >&2; exit 2; }
+# Use the active environment's interpreter. ENV_PREFIX still wins when set,
+# so a bootstrap-built prefix keeps working unchanged.
+if [ -n "${ENV_PREFIX:-}" ]; then
+  PY="$ENV_PREFIX/bin/python"
+else
+  PY="$(command -v python || command -v python3 || true)"
+fi
+[ -n "${PY:-}" ] && [ -x "$PY" ] || {
+  echo "ERROR: no usable python — activate your environment, or set ENV_PREFIX" >&2; exit 2; }
+"$PY" -c 'import vllm' 2>/dev/null || {
+  echo "ERROR: vllm is not importable from $PY" >&2
+  echo "       run scripts/bootstrap-sm70.sh with this environment active" >&2; exit 2; }
 
 K="${K:-7}"; K1=$((K + 1)); K2=$((K1 * 2))
 # Bind to loopback by default. This server has NO authentication: anything that
@@ -81,6 +93,7 @@ THINKING="${THINKING:-true}"
 # never uses. 256 recovers it. Raise this for genuinely long contexts
 # (>32k actual), where 1024 is the default for a reason.
 DECODE_PARTITION="${DECODE_PARTITION:-256}"
+TP="${TP:-2}"
 LOG="${LOG:-$REPO_ROOT/serve.log}"
 
 # ---- 1. never boot over occupied GPUs ------------------------------------
@@ -118,7 +131,22 @@ cleanup_on_fail() {
 trap 'cleanup_on_fail' INT TERM
 
 rm -f "$LOG"
+# +rms_norm_gated (2026-08-20). The SM70 profile sets custom_ops=['none'],
+# which disables EVERY CustomOp -- including RMSNormGated. That sent the gated
+# RMSNorm in all 48 GDN linear-attention layers through
+# `RMSNormGated.forward_static`, whose own docstring calls it "Pure-PyTorch RMS
+# normalization": x.float() / pow(2).mean() / rsqrt / silu / .to(orig_dtype) as
+# separate eager aten kernels, 387 launches each per capture. Re-enabling just
+# this one op routes it to the fused Triton `rmsnorm_fn` in forward_cuda.
+# Measured A/B (k=3, fp8 KV, 64k, identical build): ms/round 42.82 -> 38.89,
+# 42.50 -> 38.57, 42.51 -> 38.42 (-9.2 to -9.6%); GPU kernels per capture
+# 19,096 -> 15,327; the mean/rsqrt/silu kernels drop to exactly zero.
+# Correctness: AIME fixture 01 medium 5 seeds 5/5 (all 277), and a
+# teacher-forced KL divergence over 346 positions of mean 3.96e-06 nats with
+# 100% top-1 agreement -- fp reassociation noise, not a behavioural change.
+# Scope: this enables ONE op by name. The blanket 'none' still governs the rest.
 echo "==> serving $CKPT  (k=$K, GMU=$GMU, MML=$MML, partition=$DECODE_PARTITION)"
+echo "==> interpreter: $PY"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}" \
@@ -143,7 +171,7 @@ setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --trust-remote-code \
   --dtype float16 \
   --attention-backend FLASH_ATTN_V100 \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size "$TP"  \
   --gpu-memory-utilization "$GMU" \
   --max-model-len "$MML" \
   --max-num-seqs "$MNS" \
@@ -152,7 +180,7 @@ setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --default-chat-template-kwargs "{\"enable_thinking\":$THINKING}" \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice --tool-call-parser hermes \
-  --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2]}" \
+  --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2],\"custom_ops\":[\"none\",\"+rms_norm_gated\"]}" \
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"draft_sample_method\":\"greedy\",\"use_local_argmax_reduction\":true}" \
   --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
 SERVER_PID=$!
@@ -255,7 +283,7 @@ INELIGIBLE=$(grep -c "QPN8_CENSUS_LOAD.*eligible=NO" "$LOG" || true)
 # The launch claim is an EXACT number: 2 protected modules per layer x 64
 # layers x 4 ranks = 512. "Any positive count" would pass a boot that silently
 # dropped modules, which is the failure this gate exists to catch.
-CENSUS_EXPECTED=$((128 * 4))
+CENSUS_EXPECTED=$((128 * TP))
 [ "${CENSUS:-0}" = "$CENSUS_EXPECTED" ] && [ "${INELIGIBLE:-0}" = 0 ] \
   && gate "QPN8 census exactly $CENSUS_EXPECTED, 0 ineligible" ok \
   || gate "QPN8 census exactly $CENSUS_EXPECTED" fail "census=$CENSUS ineligible=$INELIGIBLE"

@@ -12,3 +12,5 @@ __pycache__/
 build/
 dist/
 *.so
+.venv-sm70
+Qwen3.8*

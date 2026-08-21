@@ -327,28 +327,60 @@ __global__ void skinny_nvfp4_wmma(const uint8_t *__restrict__ codes,
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
   const int wn = warp % WN, wm = warp / WN;
+  // nb comes from blockIdx.x, mb from blockIdx.y: this kernel body is
+  // shared by ALL wmma configs (M<=16, <=32, <=64, and the grid-tiled
+  // M>64 branch below), and the three smaller configs still launch a 1D
+  // grid (dim3(n/NT)), where blockIdx.y is always 0. nb MUST come from
+  // blockIdx.x for those to keep selecting the right N-tile. (A same-
+  // session attempt to put N on blockIdx.y instead, to test whether it
+  // improves L2 locality for the M>64 branch, broke exactly this way --
+  // it silently pinned nb=0 for every block in the three unmodified
+  // configs. Revisiting that idea needs all four launch sites updated
+  // together, not just the new one.)
   const int nb = blockIdx.x * NT;
+  const int mb = blockIdx.y * MT;
 
   uint2 st_c[CSEG];
   unsigned char st_s[CSEG];
   uint4 st_x[XSEG];
 
+  // Per-thread (n,s)/(m,j4) work-item indices depend only on tid/i, never
+  // on k0 -- but load_stage/store_stage recomputed them (division + modulo
+  // by KC/16 and KC/8, each expanding to an IMAD/SHF/LOP3 chain) on EVERY
+  // call, i.e. once per K-chunk. SASS for the M-tiled config showed ~50-90
+  // integer instructions per K-chunk iteration that were doing this exact,
+  // unchanging arithmetic 20 times over for K=5120/KC=256. Hoisting it
+  // outside the K-loop changes nothing about what's computed, only when.
+  int c_n[CSEG], c_s[CSEG];
+#pragma unroll
+  for (int i = 0; i < CSEG; i++) {
+    const int idx = tid + i * NTHREADS;
+    c_n[i] = idx / (KC / 16);
+    c_s[i] = idx % (KC / 16);
+  }
+  int x_m[XSEG], x_j4[XSEG], x_gm[XSEG];
+#pragma unroll
+  for (int i = 0; i < XSEG; i++) {
+    const int idx = tid + i * NTHREADS;
+    x_m[i] = idx / (KC / 8);
+    x_j4[i] = idx % (KC / 8);
+    x_gm[i] = mb + x_m[i];
+  }
+
   auto load_stage = [&](int k0) {
 #pragma unroll
     for (int i = 0; i < CSEG; i++) {
-      const int idx = tid + i * NTHREADS;
-      const int n = idx / (KC / 16), s = idx % (KC / 16);
       st_c[i] = __ldcs(reinterpret_cast<const uint2 *>(
-          codes + (size_t)(nb + n) * (K >> 1) + (k0 >> 1) + s * 8));
-      st_s[i] = __ldcs(scales + (size_t)(nb + n) * (K >> 4) + (k0 >> 4) + s);
+          codes + (size_t)(nb + c_n[i]) * (K >> 1) + (k0 >> 1) +
+          c_s[i] * 8));
+      st_s[i] = __ldcs(scales + (size_t)(nb + c_n[i]) * (K >> 4) +
+                       (k0 >> 4) + c_s[i]);
     }
 #pragma unroll
     for (int i = 0; i < XSEG; i++) {
-      const int idx = tid + i * NTHREADS;
-      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
-      st_x[i] = (m < m_real)
-                    ? *reinterpret_cast<const uint4 *>(x + (size_t)m * K + k0 +
-                                                       j4 * 8)
+      st_x[i] = (x_gm[i] < m_real)
+                    ? *reinterpret_cast<const uint4 *>(
+                          x + (size_t)x_gm[i] * K + k0 + x_j4[i] * 8)
                     : make_uint4(0, 0, 0, 0);
     }
   };
@@ -356,10 +388,8 @@ __global__ void skinny_nvfp4_wmma(const uint8_t *__restrict__ codes,
   auto store_stage = [&]() {
 #pragma unroll
     for (int i = 0; i < CSEG; i++) {
-      const int idx = tid + i * NTHREADS;
-      const int n = idx / (KC / 16), s = idx % (KC / 16);
       const half2 sc2 = fp8e4m3_to_half2(st_s[i]);
-      half2 *wrow = reinterpret_cast<half2 *>(ws + n * PW + s * 16);
+      half2 *wrow = reinterpret_cast<half2 *>(ws + c_n[i] * PW + c_s[i] * 16);
       const unsigned qs[2] = {st_c[i].x, st_c[i].y};
 #pragma unroll
       for (int w = 0; w < 2; w++) {
@@ -382,11 +412,8 @@ __global__ void skinny_nvfp4_wmma(const uint8_t *__restrict__ codes,
       }
     }
 #pragma unroll
-    for (int i = 0; i < XSEG; i++) {
-      const int idx = tid + i * NTHREADS;
-      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
-      *reinterpret_cast<uint4 *>(xs + m * PX + j4 * 8) = st_x[i];
-    }
+    for (int i = 0; i < XSEG; i++)
+      *reinterpret_cast<uint4 *>(xs + x_m[i] * PX + x_j4[i] * 8) = st_x[i];
   };
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> cfrag;
@@ -421,7 +448,7 @@ __global__ void skinny_nvfp4_wmma(const uint8_t *__restrict__ codes,
   __syncwarp();
   for (int e = lane; e < 256; e += 32) {
     const int i = e >> 4, j = e & 15;  // i: n within tile, j: m within tile
-    const int gm = wm * 16 + j, gn = nb + wn * 16 + i;
+    const int gm = mb + wm * 16 + j, gn = nb + wn * 16 + i;
     #ifndef SKINNY_LUT_CVT
     const float gs_eff = gscale * 16384.f;  // undo dequant8_tm's 2^-14
 #else
@@ -802,6 +829,8 @@ torch::Tensor skinny_gemm_simt(torch::Tensor x, torch::Tensor codes,
   return y;
 }
 
+static void set_smem_opt(const void *kern, int smem);
+
 torch::Tensor skinny_gemm_wmma(torch::Tensor x, torch::Tensor codes,
                                torch::Tensor scales, double gscale) {
   int64_t m, n, k;
@@ -828,8 +857,199 @@ torch::Tensor skinny_gemm_wmma(torch::Tensor x, torch::Tensor codes,
   // shapes (occupancy sweep 2026-08: 0.327 vs 0.350 ms/layer-set, -6.6%).
   else if (m <= 32) LAUNCH_WMMA(2, 2, 128);
   else if (m <= 64) LAUNCH_WMMA(2, 4, 128);
-  else TORCH_CHECK(false, "wmma kernel supports M <= 64, got ", m);
+  else {
+    // MT=128, grid-tiled over M via blockIdx.y (VLLM_SKINNY_QPN_UNIFY's
+    // prefill path, 2026-08-20). This covers the WHOLE M range in ONE
+    // launch -- the earlier version of this band called the M<=128 kernel
+    // repeatedly from Python for M>128, which forced a full N-sweep (every
+    // OTHER N-tile's weight bytes) between two touches of the SAME
+    // N-tile, evicting it from L2 well before the "next" M-chunk's launch
+    // read it again: measured 33.6ms at M=4096 against a naive from-HBM
+    // 32x-reread floor of 1.8ms -- worse than even naively re-reading from
+    // HBM every time. N stays on blockIdx.x here (matching the three
+    // smaller configs above, which share this kernel body and still
+    // launch a 1D grid where blockIdx.y is always 0 -- nb MUST come from
+    // blockIdx.x for those). A same-session attempt to put N on the SLOW
+    // axis instead, to test whether it improves cross-block L2 reuse,
+    // broke those three configs (it pinned their nb at 0 for every
+    // block) and was reverted; that idea needs all four launch sites
+    // updated together, not just this one.
+    //
+    // MT=256 does NOT fit at any KC: load_stage's CSEG = NT*(KC/16) /
+    // NTHREADS must be a positive integer (the per-thread code-segment
+    // count for the load phase), and every (WN,WM,KC) that makes that
+    // divide evenly at MT=256 needs a KC large enough to blow well past
+    // the 96 KB smem ceiling. MT=128 (WN=2,WM=8,KC=256) is the largest
+    // tile that satisfies both constraints. 85 KB smem, past the 48 KB
+    // default -- needs the same carveout opt-in skinny_gemm_wmma_cfg
+    // already uses for its 96 KB configs.
+    constexpr int NT = 32, MT = 128, KC = 256;
+    TORCH_CHECK(n % NT == 0, "N must be a multiple of ", NT);
+    TORCH_CHECK(k % KC == 0, "K must be a multiple of ", KC);
+    const int smem = (NT + MT) * (KC + 16) * (int)sizeof(half);
+    const int grid_y = (int)((m + MT - 1) / MT);
+    set_smem_opt((const void *)&skinny_nvfp4_wmma<2, 8, KC>, smem);
+    skinny_nvfp4_wmma<2, 8, KC><<<dim3(n / NT, grid_y), dim3(2 * 8 * 32),
+                                  smem, stream>>>(
+        codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(y.data_ptr<at::Half>()), (int)n, (int)k,
+        (int)m, (float)gscale);
+  }
 #undef LAUNCH_WMMA
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+// ---------------------------------------------------------------------------
+// EXPERIMENTAL, isolated A/B copy of the MT=128 grid-tiled band in
+// skinny_gemm_wmma, existing ONLY to test whether putting N on the slow
+// grid axis (vs the fast one, as skinny_nvfp4_wmma always uses) changes L2
+// reuse across M-tiles sharing an N-tile. A literal standalone copy, not a
+// shared body -- a same-session attempt to swap axes in the shared kernel
+// broke the three other (still-1D-grid) configs that body also serves,
+// since they assume blockIdx.x==N-tile unconditionally. This kernel is
+// wired to its own pybind entry, never the serving dispatch in marlin.py;
+// promote it only if it wins a real A/B, and only after updating every
+// caller of skinny_nvfp4_wmma consistently, not just this one.
+template <int WN, int WM, int KC>
+__global__ void skinny_nvfp4_wmma_swapaxis(
+    const uint8_t *__restrict__ codes, const uint8_t *__restrict__ scales,
+    const half *__restrict__ x, half *__restrict__ y, int N, int K,
+    int m_real, float gscale) {
+  constexpr int NT = WN * 16, MT = WM * 16;
+  constexpr int PW = KC + 16, PX = KC + 16;
+  constexpr int NTHREADS = WN * WM * 32;
+  constexpr int CSEG = NT * (KC / 16) / NTHREADS;
+  constexpr int XSEG = MT * (KC / 8) / NTHREADS;
+  static_assert(CSEG * NTHREADS == NT * (KC / 16), "code seg split");
+  static_assert(XSEG * NTHREADS == MT * (KC / 8), "x seg split");
+
+  extern __shared__ char smem_raw[];
+  half *ws = reinterpret_cast<half *>(smem_raw);
+  half *xs = ws + NT * PW;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const int wn = warp % WN, wm = warp / WN;
+  // The ONLY difference from skinny_nvfp4_wmma: N on blockIdx.y (slow),
+  // M on blockIdx.x (fast). This kernel is ONLY ever launched with a 2D
+  // grid by its own dedicated wrapper below, so there's no shared-body
+  // hazard here.
+  const int nb = blockIdx.y * NT;
+  const int mb = blockIdx.x * MT;
+
+  uint2 st_c[CSEG];
+  unsigned char st_s[CSEG];
+  uint4 st_x[XSEG];
+
+  auto load_stage = [&](int k0) {
+#pragma unroll
+    for (int i = 0; i < CSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int n = idx / (KC / 16), s = idx % (KC / 16);
+      st_c[i] = __ldcs(reinterpret_cast<const uint2 *>(
+          codes + (size_t)(nb + n) * (K >> 1) + (k0 >> 1) + s * 8));
+      st_s[i] = __ldcs(scales + (size_t)(nb + n) * (K >> 4) + (k0 >> 4) + s);
+    }
+#pragma unroll
+    for (int i = 0; i < XSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
+      const int gm = mb + m;
+      st_x[i] = (gm < m_real)
+                    ? *reinterpret_cast<const uint4 *>(x + (size_t)gm * K +
+                                                       k0 + j4 * 8)
+                    : make_uint4(0, 0, 0, 0);
+    }
+  };
+
+  auto store_stage = [&]() {
+#pragma unroll
+    for (int i = 0; i < CSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int n = idx / (KC / 16), s = idx % (KC / 16);
+      const half2 sc2 = fp8e4m3_to_half2(st_s[i]);
+      half2 *wrow = reinterpret_cast<half2 *>(ws + n * PW + s * 16);
+      const unsigned qs[2] = {st_c[i].x, st_c[i].y};
+#pragma unroll
+      for (int w = 0; w < 2; w++) {
+        half2 t[4];
+        dequant8_tm(qs[w], sc2, t);
+        const unsigned *tr = reinterpret_cast<const unsigned *>(t);
+        unsigned lin[4] = {__byte_perm(tr[0], tr[1], 0x5410),
+                           __byte_perm(tr[2], tr[3], 0x5410),
+                           __byte_perm(tr[0], tr[1], 0x7632),
+                           __byte_perm(tr[2], tr[3], 0x7632)};
+#pragma unroll
+        for (int pi = 0; pi < 4; pi++)
+          wrow[w * 4 + pi] = *reinterpret_cast<half2 *>(&lin[pi]);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < XSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
+      *reinterpret_cast<uint4 *>(xs + m * PX + j4 * 8) = st_x[i];
+    }
+  };
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> cfrag;
+  wmma::fill_fragment(cfrag, 0.f);
+
+  load_stage(0);
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    __syncthreads();
+    store_stage();
+    __syncthreads();
+    if (k0 + KC < K) load_stage(k0 + KC);
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b[2];
+    wmma::load_matrix_sync(a[0], ws + wn * 16 * PW, PW);
+    wmma::load_matrix_sync(b[0], xs + wm * 16 * PX, PX);
+#pragma unroll
+    for (int kk = 0; kk < KC / 16; kk++) {
+      const int cur = kk & 1, nxt = cur ^ 1;
+      if (kk + 1 < KC / 16) {
+        wmma::load_matrix_sync(a[nxt], ws + wn * 16 * PW + (kk + 1) * 16, PW);
+        wmma::load_matrix_sync(b[nxt], xs + wm * 16 * PX + (kk + 1) * 16, PX);
+      }
+      wmma::mma_sync(cfrag, a[cur], b[cur], cfrag);
+    }
+  }
+
+  __syncthreads();
+  float *cs = reinterpret_cast<float *>(smem_raw) + warp * 256;
+  wmma::store_matrix_sync(cs, cfrag, 16, wmma::mem_row_major);
+  __syncwarp();
+  for (int e = lane; e < 256; e += 32) {
+    const int i = e >> 4, j = e & 15;
+    const int gm = mb + wm * 16 + j, gn = nb + wn * 16 + i;
+    const float gs_eff = gscale * 16384.f;
+    if (gm < m_real) y[(size_t)gm * N + gn] = __float2half(cs[e] * gs_eff);
+  }
+}
+
+torch::Tensor skinny_gemm_wmma_swapaxis(torch::Tensor x, torch::Tensor codes,
+                                        torch::Tensor scales,
+                                        double gscale) {
+  int64_t m, n, k;
+  check_inputs(x, codes, scales, m, n, k);
+  auto y = torch::empty({m, n}, x.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int NT = 32, MT = 128, KC = 256;
+  TORCH_CHECK(n % NT == 0, "N must be a multiple of ", NT);
+  TORCH_CHECK(k % KC == 0, "K must be a multiple of ", KC);
+  const int smem = (NT + MT) * (KC + 16) * (int)sizeof(half);
+  const int grid_x = (int)((m + MT - 1) / MT);
+  set_smem_opt((const void *)&skinny_nvfp4_wmma_swapaxis<2, 8, KC>, smem);
+  skinny_nvfp4_wmma_swapaxis<2, 8, KC><<<dim3(grid_x, n / NT),
+                                        dim3(2 * 8 * 32), smem, stream>>>(
+      codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+      reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+      reinterpret_cast<half *>(y.data_ptr<at::Half>()), (int)n, (int)k,
+      (int)m, (float)gscale);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
@@ -1886,6 +2106,237 @@ torch::Tensor skinny_gemm_qpn8(torch::Tensor x, torch::Tensor qcodes,
   return y;
 }
 
+// ---------------------------------------------------------------------------
+// QPN unprepack: inverse of the host-side _qpn_prepack permutation
+// (fork_patches/marlin.py), as a CUDA kernel instead of PyTorch advanced
+// indexing. Pure byte/nibble shuffle -- no floating point, no MMA fragment
+// coupling -- so it carries none of the correctness risk of adapting a
+// dequant kernel to a different operand layout. It exists because the
+// Python version (index_put_ with expanded int64 index tensors) turned out
+// to dominate the transient-reconstruct cost measured in
+// benchmarks/qpn_recon_vs_marlin.py: at M=17 the Python path was ~100x
+// slower than marlin, and profiling showed the unprepack step, not the
+// GEMM, was the bottleneck. Recovers checkpoint-native (codes, scales)
+// byte-for-byte -- verified byte-identical against the Python
+// implementation, which is itself round-trip-verified against
+// _qpn_prepack (see qpn_unprepack_correctness in the benchmarks dir).
+//
+// v1 (superseded below) was one thread per (tile, group, lane), writing its
+// 8-byte output directly to codes[n_idx][group*8:+8]. Reads were coalesced
+// (32 lanes -> 32 contiguous 8-byte qc chunks) but writes were not: n_idx
+// = tile*32 + col[lane], and col[] is a permutation, so 32 lanes write 8
+// bytes each to 32 DIFFERENT ROWS (each row ~2-17KB apart on this model's
+// shapes). No amount of thread-index reshuffling fixes that on its own --
+// 8 bytes to 32 far-apart addresses is never one coalesced transaction,
+// regardless of which thread owns which address. Measured ~18 GB/s
+// (physical peak on this card is 700+ GB/s).
+//
+// v2: shared-memory relay, standard for exactly this shape of problem
+// (scatter-transpose). One block covers one tile (32 output rows) x up to
+// 32 groups.
+//
+//   Read phase:  thread (lane, gslot) reads qc[tile, group_base+gslot,
+//                lane, :8] -- SAME coalesced read as v1 (32 lanes, 32
+//                contiguous chunks) -- and stashes its decoded 8 bytes
+//                into shared[row=col[lane]][gslot]. The store address is
+//                still col[]-permuted, but that's a scatter WITHIN shared
+//                memory (bank conflicts, cheap) instead of across global
+//                memory (cache-line misses, expensive).
+//   Write phase: reinterpret the same 1024 threads as (row, gslot) instead
+//                of (gslot, lane) -- i.e. one warp per row. Warp `row`
+//                reads shared[row][0..31] and writes codes[tile*32+row]
+//                [group_base*8 : group_base*8+256], 32 lanes x 8
+//                contiguous bytes each = one coalesced 256B transaction
+//                per warp, instead of 32 separate 8B ones.
+//
+// No new arithmetic versus v1 (same col[]/korder[] maps, same per-thread
+// nibble reassembly) -- only the memory traffic pattern changes, so this
+// carries the same correctness argument v1 did. Verified byte-identical
+// against v1 and the Python implementation across every shape in this
+// model (benchmarks/qpn_unprepack_v2_check.py).
+__constant__ uint8_t QPN_KORDER[16] = {0, 2, 4, 6, 1, 3, 5, 7,
+                                       8, 10, 12, 14, 9, 11, 13, 15};
+
+__global__ void skinny_nvfp4_qpn_unprepack_v2(
+    const uint8_t *__restrict__ qc, const uint8_t *__restrict__ qs,
+    uint8_t *__restrict__ codes, uint8_t *__restrict__ scales, int n, int k) {
+  const int groups = k >> 4;
+  const long tile = blockIdx.x;
+  const int group_base = blockIdx.y * 32;
+
+  __shared__ uint8_t smem_c[32][32][8];  // [row][gslot][byte]
+  __shared__ uint8_t smem_s[32][32];     // [row][gslot]
+
+  const int tid = threadIdx.x;           // 0..1023
+  const int lane = tid & 31;
+  const int gslot_r = tid >> 5;          // read-phase group slot
+  const int group_r = group_base + gslot_r;
+
+  if (group_r < groups) {
+    const int col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    const uint8_t *src =
+        qc + (tile * groups + group_r) * 32 * 8 + (long)lane * 8;
+    uint8_t nib[16];
+#pragma unroll
+    for (int b = 0; b < 8; b++) {
+      const uint8_t byte = src[b];
+      nib[QPN_KORDER[2 * b]] = byte & 0xF;
+      nib[QPN_KORDER[2 * b + 1]] = byte >> 4;
+    }
+#pragma unroll
+    for (int b = 0; b < 8; b++)
+      smem_c[col][gslot_r][b] = nib[2 * b] | (nib[2 * b + 1] << 4);
+    smem_s[col][gslot_r] = qs[(tile * groups + group_r) * 32 + lane];
+  }
+  __syncthreads();
+
+  // write phase: one warp per row (row = tid/32, group-slot = tid%32).
+  const int row = tid >> 5;
+  const int gslot_w = tid & 31;
+  const int group_w = group_base + gslot_w;
+  if (group_w < groups) {
+    const int n_idx = (int)(tile * 32 + row);
+    uint8_t *dst = codes + (long)n_idx * (k >> 1) + (long)group_w * 8;
+#pragma unroll
+    for (int b = 0; b < 8; b++) dst[b] = smem_c[row][gslot_w][b];
+    scales[(long)n_idx * groups + group_w] = smem_s[row][gslot_w];
+  }
+}
+
+// Fused unprepack + dequant: qpn buffer -> DENSE fp16 [n][k], in one pass.
+//
+// Why this exists: on the M>16 (prefill) band a dense fp16 tensor-core GEMM
+// through cuBLAS beats Marlin by ~2x on this hardware (measured 9.2 vs 16.0
+// ms at M=4096, N=17408, K=5120) -- Marlin's in-register dequant halves its
+// tensor-core throughput (45.7 vs 87.9 TFLOP/s against a ~112 peak). The
+// only thing that made that unreachable was the cost of PRODUCING the dense
+// fp16 weight: the Python advanced-indexing reconstruction in marlin.py cost
+// ~22 ms per call and, being O(N*K), was flat in M -- it swamped the entire
+// GEMM it was meant to feed.
+//
+// This is that reconstruction as a memory-bound kernel instead: read the
+// packed qpn bytes (N*K/2 + N*K/16) and write N*K halves, nothing else. At
+// gate/up size that is 50 MB in / 178 MB out, i.e. a few tenths of a ms at
+// Volta HBM speed rather than tens of ms.
+//
+// Same index math as skinny_nvfp4_qpn_unprepack_v2 above (same col[]/KORDER
+// maps, same smem staging so the *output* stores stay coalesced -- the read
+// phase's natural lane->row mapping would otherwise scatter the fp16 writes
+// k*2 bytes apart). Decode is the shipped dequant_pair LUT decoder and
+// fp8e4m3_to_half2, so the values it produces are bit-identical to what the
+// QPN/wmma kernels already compute from the same bytes.
+//
+// The result is transient by contract: the caller builds it for one matmul
+// and frees it. Nothing here persists a second weight copy.
+__global__ void skinny_nvfp4_qpn_dequant(
+    const uint8_t *__restrict__ qc, const uint8_t *__restrict__ qs,
+    half *__restrict__ out, int n, int k, float gscale) {
+  const int groups = k >> 4;
+  const long tile = blockIdx.x;
+  const int group_base = blockIdx.y * 32;
+
+  __shared__ uint8_t smem_c[32][32][8];  // [row][gslot][byte]
+  __shared__ uint8_t smem_s[32][32];     // [row][gslot]
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int gslot_r = tid >> 5;
+  const int group_r = group_base + gslot_r;
+
+  if (group_r < groups) {
+    const int col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    const uint8_t *src =
+        qc + (tile * groups + group_r) * 32 * 8 + (long)lane * 8;
+    uint8_t nib[16];
+#pragma unroll
+    for (int b = 0; b < 8; b++) {
+      const uint8_t byte = src[b];
+      nib[QPN_KORDER[2 * b]] = byte & 0xF;
+      nib[QPN_KORDER[2 * b + 1]] = byte >> 4;
+    }
+#pragma unroll
+    for (int b = 0; b < 8; b++)
+      smem_c[col][gslot_r][b] = nib[2 * b] | (nib[2 * b + 1] << 4);
+    smem_s[col][gslot_r] = qs[(tile * groups + group_r) * 32 + lane];
+  }
+  __syncthreads();
+
+  // write phase: one warp per row, lane = group slot. Consecutive lanes
+  // write consecutive 32-byte runs of the SAME output row, so a warp emits
+  // 1 KB of contiguous fp16.
+  const int row = tid >> 5;
+  const int gslot_w = tid & 31;
+  const int group_w = group_base + gslot_w;
+  if (group_w < groups) {
+    const int n_idx = (int)(tile * 32 + row);
+    const half hg = __float2half(gscale);
+    half2 sc2 = __hmul2(fp8e4m3_to_half2(smem_s[row][gslot_w]),
+                        __halves2half2(hg, hg));
+    // 8 bytes = 16 e2m1 codes, in checkpoint k-order; byte b holds codes
+    // (2b, 2b+1), which is exactly dequant_pair's input convention.
+    const uint32_t *w =
+        reinterpret_cast<const uint32_t *>(&smem_c[row][gslot_w][0]);
+    const unsigned q0 = w[0], q1 = w[1];
+    __align__(16) half2 o[8];
+#pragma unroll
+    for (int pi = 0; pi < 4; pi++) o[pi] = dequant_pair(q0, pi, sc2);
+#pragma unroll
+    for (int pi = 0; pi < 4; pi++) o[4 + pi] = dequant_pair(q1, pi, sc2);
+    int4 *dst = reinterpret_cast<int4 *>(out + (long)n_idx * k +
+                                         (long)group_w * 16);
+    dst[0] = *reinterpret_cast<const int4 *>(&o[0]);
+    dst[1] = *reinterpret_cast<const int4 *>(&o[4]);
+  }
+}
+
+torch::Tensor skinny_qpn_dequant(torch::Tensor qc, torch::Tensor qs,
+                                 int64_t n, int64_t k, double gscale) {
+  TORCH_CHECK(qc.is_cuda() && qc.dtype() == torch::kUInt8 &&
+              qc.is_contiguous());
+  TORCH_CHECK(qs.is_cuda() && qs.dtype() == torch::kUInt8 &&
+              qs.is_contiguous());
+  TORCH_CHECK(n % 32 == 0 && k % 16 == 0, "n%32, k%16");
+  TORCH_CHECK(qc.numel() == (long)n * (k >> 1), "qc size");
+  TORCH_CHECK(qs.numel() == (long)n * (k >> 4), "qs size");
+  auto out = torch::empty(
+      {n, k}, qc.options().dtype(torch::kFloat16));
+  const int tiles = (int)(n / 32);
+  const int groups = (int)(k >> 4);
+  const int group_blocks = (groups + 31) / 32;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  skinny_nvfp4_qpn_dequant<<<dim3(tiles, group_blocks), dim3(1024), 0,
+                             stream>>>(
+      qc.data_ptr<uint8_t>(), qs.data_ptr<uint8_t>(),
+      reinterpret_cast<half *>(out.data_ptr<at::Half>()), (int)n, (int)k,
+      (float)gscale);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+std::vector<torch::Tensor> skinny_qpn_unprepack(torch::Tensor qc,
+                                                torch::Tensor qs, int64_t n,
+                                                int64_t k) {
+  TORCH_CHECK(qc.is_cuda() && qc.dtype() == torch::kUInt8 &&
+              qc.is_contiguous());
+  TORCH_CHECK(qs.is_cuda() && qs.dtype() == torch::kUInt8 &&
+              qs.is_contiguous());
+  TORCH_CHECK(n % 32 == 0 && k % 16 == 0, "n%32, k%16");
+  TORCH_CHECK(qc.numel() == (long)n * (k >> 1), "qc size");
+  TORCH_CHECK(qs.numel() == (long)n * (k >> 4), "qs size");
+  auto codes = torch::empty({n, k / 2}, qc.options());
+  auto scales = torch::empty({n, k / 16}, qc.options());
+  const int tiles = (int)(n / 32);
+  const int groups = (int)(k >> 4);
+  const int group_blocks = (groups + 31) / 32;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  skinny_nvfp4_qpn_unprepack_v2<<<dim3(tiles, group_blocks), dim3(1024), 0,
+                                  stream>>>(
+      qc.data_ptr<uint8_t>(), qs.data_ptr<uint8_t>(),
+      codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), (int)n, (int)k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {codes, scales};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_qpn8", &skinny_gemm_qpn8,
         "skinny FP8 E4M3 GEMM (QPN8, M<=8)");
@@ -1903,11 +2354,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_simt", &skinny_gemm_simt, "skinny NVFP4 GEMM (SIMT, M<=8)");
   m.def("gemm_simt_argmax", &skinny_gemm_simt_argmax,
         "fused NVFP4 lm_head GEMM + greedy argmax (M=1; block val/idx)");
-  m.def("gemm_wmma", &skinny_gemm_wmma, "skinny NVFP4 GEMM (WMMA, M<=64)");
+  m.def("gemm_wmma", &skinny_gemm_wmma,
+        "skinny NVFP4 GEMM (WMMA, any M, grid-tiled above M=64)");
+  m.def("gemm_wmma_swapaxis", &skinny_gemm_wmma_swapaxis,
+        "EXPERIMENTAL A/B only, M>64: gemm_wmma with N/M grid axes "
+        "swapped, to test cross-block L2 reuse. Not wired into serving.");
   m.def("gemm_mma8", &skinny_gemm_mma8,
         "skinny NVFP4 GEMM (mma.m8n8k4, M<=8)");
   m.def("gemm_wmma_cfg", &skinny_gemm_wmma_cfg,
         "skinny NVFP4 GEMM (WMMA, config-selectable tile sweep)");
   m.def("gemm_wmma_splitk", &skinny_gemm_wmma_splitk,
         "skinny NVFP4 GEMM (WMMA split-K, fp32 partials)");
+  m.def("qpn_dequant", &skinny_qpn_dequant,
+        "fused unprepack+dequant: qpn buffer -> dense fp16 [n,k] (transient "
+        "prefill weight for a dense cuBLAS GEMM)");
+  m.def("qpn_unprepack", &skinny_qpn_unprepack,
+        "inverse of the host _qpn_prepack permutation: qpn buffer -> "
+        "checkpoint-native (codes, scales), pure byte shuffle");
 }

@@ -1,0 +1,290 @@
+diff --git a/flash-attention-v100/flash_attn_v100/flash_attn_interface.py b/flash-attention-v100/flash_attn_v100/flash_attn_interface.py
+index a28f757..3573552 100644
+--- a/flash-attention-v100/flash_attn_v100/flash_attn_interface.py
++++ b/flash-attention-v100/flash_attn_v100/flash_attn_interface.py
+@@ -1275,8 +1275,9 @@ def fp8_e5m2_paged_kv_to_fp16(
+     value_out: torch.Tensor,
+     k_scale: float = 1.0,
+     v_scale: float = 1.0,
++    is_e4m3: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Expand paged E5M2 K/V into preallocated FP16 paged workspaces."""
++    """Expand paged FP8 K/V into preallocated FP16 paged workspaces."""
+     flash_attn_v100_cuda.fp8_e5m2_paged_kv_to_fp16(
+         key_cache,
+         value_cache,
+@@ -1286,6 +1287,7 @@ def fp8_e5m2_paged_kv_to_fp16(
+         value_out,
+         float(k_scale),
+         float(v_scale),
++        bool(is_e4m3),
+     )
+     return key_out, value_out
+ 
+diff --git a/flash-attention-v100/include/fused_mha.h b/flash-attention-v100/include/fused_mha.h
+index e778ed0..f4e9036 100644
+--- a/flash-attention-v100/include/fused_mha.h
++++ b/flash-attention-v100/include/fused_mha.h
+@@ -222,7 +222,8 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+     at::Tensor& key_out,
+     at::Tensor& value_out,
+     const float key_scale,
+-    const float value_scale
++    const float value_scale,
++    const bool is_e4m3 = false
+ );
+ 
+ std::vector<at::Tensor> flash_attention_backward(
+diff --git a/flash-attention-v100/kernel/flash_decode_paged.cu b/flash-attention-v100/kernel/flash_decode_paged.cu
+index f336475..e61b60f 100644
+--- a/flash-attention-v100/kernel/flash_decode_paged.cu
++++ b/flash-attention-v100/kernel/flash_decode_paged.cu
+@@ -161,6 +161,14 @@ bool xqa_e5m2_partition_page_ids_enabled() {
+   return value == nullptr || value[0] != '0';
+ }
+ 
++// The XQA tile launchers infer the KV flavour from k_cache.scalar_type(), which
++// cannot distinguish FP8 E4M3 from E5M2 -- both are stored as uint8. The host
++// entry resolves kv_cache_dtype to a code and publishes it here so the uint8
++// branch can pick the right decoder. thread_local because several host threads
++// may drive different streams concurrently.
++static thread_local int g_xqa_fp8_kv_dtype =
++    flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
++
+ bool xqa_e5m2_pair_load_enabled() {
+   const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD");
+   return value == nullptr || value[0] != '0';
+@@ -426,6 +434,30 @@ fp8_e5m2_pair_to_half2_bits(const uint16_t raw_pair) {
+          (static_cast<uint32_t>(raw_pair & 0xff00u) << 16);
+ }
+ 
++// E4M3 -> fp16 by shift. E4M3 has exponent bias 7 vs fp16's 15, so moving the
++// sign to bit 15 and the exponent+mantissa field up by 7 yields exactly
++// value * 2^-8, i.e. value/256. That factor is folded into k_scale/v_scale at
++// the host entry, so the inner loop carries no extra multiply. Verified
++// exhaustively against fp8_e4m3fn_to_float over all 256 byte patterns: exact
++// for every finite value including all denormals. The two NaN encodings
++// (0x7f, 0xff) map to +/-480*2^-8 rather than NaN, matching the same trick
++// already used for NVFP4 group scales elsewhere in this stack.
++__device__ __forceinline__ uint32_t
++fp8_e4m3_pair_to_half2_bits(const uint16_t raw_pair) {
++  const uint32_t p = static_cast<uint32_t>(raw_pair);
++  const uint32_t lo = ((p & 0x0080u) << 8) | ((p & 0x007fu) << 7);
++  const uint32_t hi = ((p & 0x8000u) << 16) | ((p & 0x7f00u) << 15);
++  return lo | hi;
++}
++
++__device__ __forceinline__ uint4 fp8_e4m3_vector_to_half8(const uint64_t raw) {
++  return make_uint4(
++      fp8_e4m3_pair_to_half2_bits(static_cast<uint16_t>(raw)),
++      fp8_e4m3_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
++      fp8_e4m3_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
++      fp8_e4m3_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
++}
++
+ __device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
+   return make_uint4(
+       fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw)),
+@@ -479,9 +511,13 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
+   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+     const uint4* cache_vec = reinterpret_cast<const uint4*>(kv_cache);
+     return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
++  } else if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
++    const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(kv_cache);
++    return fp8_e4m3_vector_to_half8(
++        __ldg(&cache_vec[physical_offset / 8 + vec_col]));
+   } else {
+     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+-                  "XQA only supports fp16 and FP8 E5M2 KV");
++                  "XQA only supports fp16, FP8 E4M3 and FP8 E5M2 KV");
+     const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(kv_cache);
+     return fp8_e5m2_vector_to_half8(
+         __ldg(&cache_vec[physical_offset / 8 + vec_col]));
+@@ -2213,7 +2249,11 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
+                 "Paired XQA loads require FP8 E5M2 KV cache");
+     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
+   } else if (k_cache.scalar_type() == at::kByte) {
+-    LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
++    if (g_xqa_fp8_kv_dtype == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
++      LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
++    } else {
++      LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
++    }
+   } else {
+     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP16);
+   }
+@@ -2562,7 +2602,7 @@ at::Tensor flash_attention_decode_paged_xqa(
+     at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+     const float softmax_scale, const int partition_size,
+     const int launch_num_partitions, const std::string& kv_cache_dtype,
+-    const float k_scale, const float v_scale, const int window_size_left,
++    const float k_scale_in, const float v_scale_in, const int window_size_left,
+     const int window_size_right) {
+   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
+   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
+@@ -2576,8 +2616,9 @@ at::Tensor flash_attention_decode_paged_xqa(
+   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
+   TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16 ||
++                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                   kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+-              "XQA decode supports fp16 and fp8_e5m2 KV cache only");
++              "XQA decode supports fp16, fp8_e4m3 and fp8_e5m2 KV cache only");
+   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
+     TORCH_CHECK(k_cache.dtype() == torch::kFloat16 &&
+                     v_cache.dtype() == torch::kFloat16,
+@@ -2585,8 +2626,21 @@ at::Tensor flash_attention_decode_paged_xqa(
+   } else {
+     TORCH_CHECK(
+         k_cache.dtype() == torch::kUInt8 && v_cache.dtype() == torch::kUInt8,
+-        "fp8_e5m2 XQA requires uint8 K/V tensors");
+-  }
++        "fp8 XQA requires uint8 K/V tensors");
++  }
++  // The E4M3 shift decoder yields value/256; fold that into the K/V scales,
++  // which are applied once per score (softmax_scale * k_scale) and once per
++  // output element (inv_part_sum * v_scale), never inside the K loop. 256 is a
++  // power of two so this multiply is exact in fp32.
++  g_xqa_fp8_kv_dtype = kv_dtype_code;
++  const float k_scale =
++      (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3)
++          ? k_scale_in * 256.0f
++          : k_scale_in;
++  const float v_scale =
++      (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3)
++          ? v_scale_in * 256.0f
++          : v_scale_in;
+   TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
+               "XQA K/V scales must be positive");
+   TORCH_CHECK(block_table.dtype() == torch::kInt32,
+diff --git a/flash-attention-v100/kernel/fp8_kv_bridge.cu b/flash-attention-v100/kernel/fp8_kv_bridge.cu
+index 9116664..2258c78 100644
+--- a/flash-attention-v100/kernel/fp8_kv_bridge.cu
++++ b/flash-attention-v100/kernel/fp8_kv_bridge.cu
+@@ -13,7 +13,7 @@ namespace {
+ 
+ constexpr int kThreads = 256;
+ 
+-template <bool UNIT_SCALE>
++template <bool UNIT_SCALE, bool IS_E4M3 = false>
+ __global__ void fp8_e5m2_paged_kv_to_fp16_kernel(
+     const void* __restrict__ key_cache, const void* __restrict__ value_cache,
+     const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+@@ -73,10 +73,19 @@ __global__ void fp8_e5m2_paged_kv_to_fp16_kernel(
+         static_cast<int64_t>(input_block_offset) * value_token_stride +
+         static_cast<int64_t>(head_idx) * value_head_stride + element_idx;
+ 
+-    key_pair =
+-        flash_v100::load_fp8_e5m2_half2_unscaled(key_cache, key_input_offset);
+-    value_pair = flash_v100::load_fp8_e5m2_half2_unscaled(value_cache,
+-                                                          value_input_offset);
++    if constexpr (IS_E4M3) {
++      // E4M3 -> fp16 by shift; yields value * 2^-8. The 256 is folded into
++      // key_scale/value_scale at the host entry.
++      key_pair = flash_v100::load_fp8_e4m3_half2_unscaled(key_cache,
++                                                          key_input_offset);
++      value_pair = flash_v100::load_fp8_e4m3_half2_unscaled(value_cache,
++                                                            value_input_offset);
++    } else {
++      key_pair =
++          flash_v100::load_fp8_e5m2_half2_unscaled(key_cache, key_input_offset);
++      value_pair = flash_v100::load_fp8_e5m2_half2_unscaled(
++          value_cache, value_input_offset);
++    }
+     if constexpr (!UNIT_SCALE) {
+       const float2 key_values = __half22float2(key_pair);
+       const float2 value_values = __half22float2(value_pair);
+@@ -109,8 +118,13 @@ __global__ void fp8_e5m2_paged_kv_to_fp16_kernel(
+ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+     const at::Tensor& key_cache, const at::Tensor& value_cache,
+     const at::Tensor& block_table, const at::Tensor& seq_lens,
+-    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+-    const float value_scale) {
++    at::Tensor& key_out, at::Tensor& value_out, const float key_scale_in,
++    const float value_scale_in, const bool is_e4m3) {
++  // The E4M3 decoder produces value*2^-8; fold 256 into the scales. Exact in
++  // fp32 (power of two). Note this makes the scales != 1, so the UNIT_SCALE
++  // specialisation is correctly bypassed for e4m3.
++  const float key_scale = is_e4m3 ? key_scale_in * 256.0f : key_scale_in;
++  const float value_scale = is_e4m3 ? value_scale_in * 256.0f : value_scale_in;
+   TORCH_CHECK(key_cache.is_cuda() && value_cache.is_cuda() &&
+                   key_out.is_cuda() && value_out.is_cuda(),
+               "FP8 KV bridge tensors must be CUDA tensors");
+@@ -164,8 +178,9 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+       batch_size);
+   const auto stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+-#define LAUNCH_FP8_BRIDGE(UNIT_SCALE)                                          \
+-  fp8_e5m2_paged_kv_to_fp16_kernel<UNIT_SCALE><<<grid, kThreads, 0, stream>>>( \
++#define LAUNCH_FP8_BRIDGE(UNIT_SCALE, E4M3)                                    \
++  fp8_e5m2_paged_kv_to_fp16_kernel<UNIT_SCALE, E4M3>                           \
++      <<<grid, kThreads, 0, stream>>>(                                         \
+       key_cache.data_ptr(), value_cache.data_ptr(),                            \
+       block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),                   \
+       reinterpret_cast<__half*>(key_out.data_ptr()),                           \
+@@ -178,10 +193,17 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+       value_out.stride(0), value_out.stride(1), value_out.stride(2),           \
+       key_scale, value_scale)
+ 
+-  if (key_scale == 1.f && value_scale == 1.f) {
+-    LAUNCH_FP8_BRIDGE(true);
++  const bool unit = (key_scale == 1.f && value_scale == 1.f);
++  if (is_e4m3) {
++    if (unit) {
++      LAUNCH_FP8_BRIDGE(true, true);
++    } else {
++      LAUNCH_FP8_BRIDGE(false, true);
++    }
++  } else if (unit) {
++    LAUNCH_FP8_BRIDGE(true, false);
+   } else {
+-    LAUNCH_FP8_BRIDGE(false);
++    LAUNCH_FP8_BRIDGE(false, false);
+   }
+ #undef LAUNCH_FP8_BRIDGE
+ 
+diff --git a/flash-attention-v100/kernel/fp8_kv_utils.cuh b/flash-attention-v100/kernel/fp8_kv_utils.cuh
+index 693b46a..265fe80 100644
+--- a/flash-attention-v100/kernel/fp8_kv_utils.cuh
++++ b/flash-attention-v100/kernel/fp8_kv_utils.cuh
+@@ -70,6 +70,24 @@ __device__ __forceinline__ __half2 load_fp8_e5m2_half2_unscaled(
+   return fp8_e5m2_pair_to_half2(cache_u16[byte_index >> 1]);
+ }
+ 
++__device__ __forceinline__ __half2 fp8_e4m3_pair_to_half2(uint16_t raw_pair) {
++  // Sign to bit 15/31, exponent+mantissa up by 7. E4M3 bias is 7 vs fp16's 15,
++  // so the result is exactly value * 2^-8 for every finite encoding (verified
++  // exhaustively, denormals included). NaN encodings map to +/-480.
++  const uint32_t p = static_cast<uint32_t>(raw_pair);
++  const uint32_t bits = (((p & 0x0080u) << 8) | ((p & 0x007fu) << 7)) |
++                        (((p & 0x8000u) << 16) | ((p & 0x7f00u) << 15));
++  union { uint32_t u; __half2 h2; } cvt;
++  cvt.u = bits;
++  return cvt.h2;
++}
++
++__device__ __forceinline__ __half2 load_fp8_e4m3_half2_unscaled(
++    const void* __restrict__ cache, const int64_t byte_index) {
++  const uint16_t* cache_u16 = reinterpret_cast<const uint16_t*>(cache);
++  return fp8_e4m3_pair_to_half2(cache_u16[byte_index >> 1]);
++}
++
+ __device__ __forceinline__ float fp8_e5m2_to_float(uint8_t raw) {
+   return __half2float(fp8_e5m2_to_half(raw));
+ }
+diff --git a/flash-attention-v100/kernel/fused_mha_api.cpp b/flash-attention-v100/kernel/fused_mha_api.cpp
+index bbd3109..31d8c2c 100644
+--- a/flash-attention-v100/kernel/fused_mha_api.cpp
++++ b/flash-attention-v100/kernel/fused_mha_api.cpp
+@@ -63,5 +63,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def(
+         "fp8_e5m2_paged_kv_to_fp16",
+         &flash_attention_fp8_e5m2_paged_kv_to_fp16,
+-        "Expand paged FP8 E5M2 K/V into a preallocated FP16 paged workspace");
++        "Expand paged FP8 K/V into a preallocated FP16 paged workspace "
++        "(E5M2 by default; pass is_e4m3=True for E4M3)",
++        py::arg("key_cache"), py::arg("value_cache"), py::arg("block_table"),
++        py::arg("seq_lens"), py::arg("key_out"), py::arg("value_out"),
++        py::arg("key_scale"), py::arg("value_scale"),
++        py::arg("is_e4m3") = false);
+ }
