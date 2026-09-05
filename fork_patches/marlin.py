@@ -59,6 +59,12 @@ _QPN_DROP_CT = os.environ.get("VLLM_SKINNY_DROP_CT", "0") == "1"
 # same bytes — kernel and launch geometry only. VLLM_SKINNY_QPN2=0
 # restores the fixed-4-warp kernel.
 _QPN2_ENABLED = os.environ.get("VLLM_SKINNY_QPN2", "1") == "1"
+# QPN2 MT band (2026-09-05): M 9..32 through skinny_nvfp4_qpn2_mt, MT row
+# tiles against ONE weight stream (mt=2 for 9..16, mt=4 for 17..32). Before
+# this, 9..16 fell to the legacy qpn kernel (2x slower) and 17..32 to a
+# per-forward dense reconstruct -- the two cliffs that stopped k=3 MTP from
+# scaling past one concurrent stream. Rows are bit-identical to qpn2's.
+_QPN2_MT_ENABLED = os.environ.get("VLLM_SKINNY_QPN2_MT", "1") == "1"
 # (K, N) -> (splitk, nacc), measured winners; heuristic covers the rest.
 # graph-mode winners (qpn_graphmatrix 2026-08-17): captured-replay is
 # the serving regime and reshuffles two cells vs the eager matrix.
@@ -370,6 +376,46 @@ def _bump_route_count(route: str, m: int) -> None:
         pass
 
 
+@custom_op("skinny_nvfp4::gemv_f16", mutates_args=())
+def _skinny_gemv_f16(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Small-N fp16 GEMV (M<=16, N<=128): x[M,K] @ w[N,K]^T, fp32 accumulate.
+    Used for the GDN in_proj_ba projection, which cuBLAS serves with a wmma
+    tile kernel plus a split-K reduce (13.6 us) for a 480 KB weight read."""
+    return _get_skinny_ext().gemv_f16(x, w)
+
+
+@_skinny_gemv_f16.register_fake
+def _skinny_gemv_f16_fake(x, w):
+    return x.new_empty((x.shape[0], w.shape[0]))
+
+
+def skinny_gemv_f16_ok(x: torch.Tensor, w: torch.Tensor) -> bool:
+    return (_skinny_ok and x.dtype == torch.float16 and w.dtype == torch.float16
+            and x.dim() == 2 and 1 <= x.shape[0] <= 16 and w.shape[0] <= 128
+            and x.shape[1] % 2 == 0 and x.is_contiguous() and w.is_contiguous())
+
+
+@custom_op("skinny_nvfp4::gdn_split3", mutates_args=())
+def _skinny_gdn_split3(x: torch.Tensor, wq: int, wk: int,
+                       wv: int) -> list[torch.Tensor]:
+    """GDN q/k/v split: strided [M, q+k+v] fp16 -> three contiguous [M, w]
+    tensors in ONE launch (replaces three strided reshape copies + a cat)."""
+    return _get_skinny_ext().gdn_split3(x, wq, wk, wv)
+
+
+@_skinny_gdn_split3.register_fake
+def _skinny_gdn_split3_fake(x, wq, wk, wv):
+    m = x.shape[0]
+    return [x.new_empty((m, wq)), x.new_empty((m, wk)), x.new_empty((m, wv))]
+
+
+def skinny_gdn_split3_ok(x: torch.Tensor, wq: int, wk: int, wv: int) -> bool:
+    return (_skinny_ok and x.dtype == torch.float16 and x.dim() == 2
+            and x.stride(1) == 1 and x.stride(0) % 8 == 0
+            and wq % 8 == 0 and wk % 8 == 0 and wv % 8 == 0
+            and x.data_ptr() % 16 == 0)
+
+
 @custom_op("skinny_nvfp4::linear", mutates_args=())
 def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
                    qpn_codes: torch.Tensor, qpn_scales: torch.Tensor,
@@ -389,6 +435,18 @@ def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
     qpn2_ok = (_QPN2_ENABLED and qpn_codes.numel() > 0 and 1 <= m <= 8
                and k % 64 == 0 and n % 32 == 0)
     qpn2_cfg = _qpn2_cfg(k, n) if qpn2_ok else None
+    # qpn2 MT owns M 9..32 (see _QPN2_MT_ENABLED). splitk is capped by the
+    # split-K staging buffer (SPLITK*MT KB <= 32 KB): 16 for mt=2, 8 for mt=4.
+    qpn2_mt = None
+    if (_QPN2_MT_ENABLED and qpn_codes.numel() > 0 and 9 <= m <= 32
+            and k % 64 == 0 and n % 32 == 0):
+        _base = _qpn2_cfg(k, n)
+        if _base is not None:
+            _mt = 2 if m <= 16 else 4
+            # T=2 N-tiles per warp (A-fragment reuse). Staging buffer is
+            # SPLITK*T*MT KB <= 96 KB: splitk <= 16 for mt=2, <= 8 for mt=4.
+            # Equal (splitk, nacc) to qpn2's keeps every row bit-identical.
+            qpn2_mt = (min(_base[0], 16 if _mt == 2 else 8), _base[1], _mt, 2)
     use_qpn1 = (not has_ct) and qpn_codes.numel() > 0 and 1 <= m <= 3 \
         and k % 64 == 0 and n % 32 == 0
     use_simt = has_ct and (not use_qpn) and 1 <= m <= 7 \
@@ -401,7 +459,8 @@ def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
     # transiently from the SAME qpn buffer instead of reading a second
     # resident copy. Never persisted -- freed the moment this call returns.
     use_reconstruct = (marlin_w.numel() == 0 and qpn_codes.numel() > 0
-                        and not (qpn2_cfg is not None or use_qpn or use_qpn1
+                        and not (qpn2_cfg is not None or qpn2_mt is not None
+                                 or use_qpn or use_qpn1
                                  or use_simt or use_wmma))
     # Dense-recon prefill band: reconstruct the fp16 weight from the qpn
     # buffer (fused CUDA kernel, memory-bound) and hand it to cuBLAS. Only
@@ -424,7 +483,8 @@ def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
     unify_dense = use_reconstruct and _u_dense_ok and (
         not _u_wmma_ok
         or (m >= _UNIFY_DENSE_MIN_M and (n * k * 2) <= _RECON_MAX_BYTES))
-    route = "qpn2" if qpn2_cfg is not None else "qpn" if use_qpn \
+    route = "qpn2" if qpn2_cfg is not None \
+        else "qpn2mt" if qpn2_mt is not None else "qpn" if use_qpn \
         else "qpn1" if use_qpn1 \
         else "simt" if use_simt else "wmma" if use_wmma \
         else ("recon" if unify_dense else "wmma_recon") if use_reconstruct \
@@ -439,6 +499,10 @@ def _skinny_linear(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor,
     if _skinny_ok and qpn2_cfg is not None:
         return _get_skinny_ext().gemm_qpn2(
             x, qpn_codes, qpn_scales, gscale, n, qpn2_cfg[0], qpn2_cfg[1])
+    if _skinny_ok and qpn2_mt is not None:
+        return _get_skinny_ext().gemm_qpn2_mtt(
+            x, qpn_codes, qpn_scales, gscale, n, qpn2_mt[0], qpn2_mt[1],
+            qpn2_mt[2], qpn2_mt[3])
     if _skinny_ok and use_qpn:
         return _get_skinny_ext().gemm_qpn(x, qpn_codes, qpn_scales, gscale, n)
     if _skinny_ok and use_qpn1:

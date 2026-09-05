@@ -535,6 +535,12 @@ def _sm70_e5_diff_probe(self, roots: dict) -> None:
 # therefore always runs; only the attention-metadata BUILD is skipped, and the
 # cached metadata objects (which alias those same buffers) are reused.
 _E5_CACHE = os.getenv("VLLM_SM70_E5_CACHE", "1") == "1"
+# v100-skinny (2026-09-05): the persistent-metadata round now serves N
+# concurrent requests in the steady spec shape (every request scheduled with
+# exactly k+1 tokens, no batch change). 1 restores the original single-
+# request behaviour; measured host cost of the generic prepare at N=2..4 was
+# ~45 ms/round, which made 2-4 concurrent MTP streams host-bound.
+_E5_MAX_REQS = int(os.getenv("VLLM_SM70_E5_MAX_REQS", "8") or "1")
 _E5_VERIFY = os.getenv("VLLM_SM70_E5_VERIFY", "0") == "1"
 # Live-drift checkpoints: run off the cache, but every Nth hit round do the
 # full build and byte-compare it against the cached objects — names the
@@ -585,9 +591,18 @@ def _e5_md_hit(self, scheduler_output) -> bool:
         return False
     so = scheduler_output
     k1 = self.num_spec_tokens + 1
-    if so.total_num_scheduled_tokens != k1 or self.input_batch.num_reqs != 1:
+    n_cached = int(self._e5_cache_state.get("num_reqs", 1))
+    num_reqs = self.input_batch.num_reqs
+    if (num_reqs != n_cached
+            or so.total_num_scheduled_tokens != k1 * num_reqs):
         _e5_reject(self, "shape")
         return False
+    if num_reqs > 1:
+        nst = so.num_scheduled_tokens
+        for rid in self.input_batch.req_ids[:num_reqs]:
+            if nst.get(rid) != k1:
+                _e5_reject(self, "shape")
+                return False
     if getattr(so, "scheduled_new_reqs", None) or \
             getattr(so, "finished_req_ids", None):
         _e5_reject(self, "batch-change")
@@ -596,7 +611,8 @@ def _e5_md_hit(self, scheduler_output) -> bool:
         _e5_reject(self, "grammar")
         return False
     spec = so.scheduled_spec_decode_tokens
-    if len(spec) != 1 or len(next(iter(spec.values()))) != self.num_spec_tokens:
+    if len(spec) != num_reqs or any(
+            len(v) != self.num_spec_tokens for v in spec.values()):
         _e5_reject(self, "spec-shape")
         return False
     if _e5_state_fp(self) != self._e5_cache_state.get("state_fp"):
@@ -605,9 +621,8 @@ def _e5_md_hit(self, scheduler_output) -> bool:
     # First decode round after prefill: the drafter catches up over the
     # whole prompt (set_inputs_first_pass, num_tokens = prompt length) and
     # needs freshly built indices/metadata — never serve it from cache.
-    if int(self.input_batch.num_computed_tokens_cpu[0]) <= int(
-        self.input_batch.num_prompt_tokens[0]
-    ):
+    if bool((self.input_batch.num_computed_tokens_cpu[:num_reqs]
+             <= self.input_batch.num_prompt_tokens[:num_reqs]).any()):
         _e5_reject(self, "drafter-catchup")
         return False
     self._e5_hit_n = getattr(self, "_e5_hit_n", 0) + 1
@@ -621,10 +636,19 @@ def _e5_cache_capture(self, scheduler_output, attn_metadata, spec_common,
                       logits_indices=None, spec_decode_metadata=None):
     if not isinstance(attn_metadata, dict) or spec_common is None:
         return
-    if self.input_batch.num_reqs != 1 \
-            or scheduler_output.total_num_scheduled_tokens != (
-                self.num_spec_tokens + 1):
+    _n = self.input_batch.num_reqs
+    _k1 = self.num_spec_tokens + 1
+    if _n < 1 or _n > _E5_MAX_REQS \
+            or scheduler_output.total_num_scheduled_tokens != _k1 * _n:
         return
+    if _n > 1:
+        _nst = scheduler_output.num_scheduled_tokens
+        if any(_nst.get(r) != _k1 for r in self.input_batch.req_ids[:_n]):
+            return
+        _sp = scheduler_output.scheduled_spec_decode_tokens
+        if len(_sp) != _n or any(
+                len(v) != self.num_spec_tokens for v in _sp.values()):
+            return
     # Never capture the first rounds after a request/state change: the
     # first decode round is the drafter's prompt catch-up and carries
     # special-shaped indices/metadata (async-optimistic counters make it
@@ -652,6 +676,7 @@ def _e5_cache_capture(self, scheduler_output, attn_metadata, spec_common,
         "spec_common": spec_common,
         "groups": groups,
         "gids": gids,
+        "num_reqs": _n,
         "flash_gids": {
             gid for obj, gid in zip(groups, gids)
             if gid is not None
@@ -662,7 +687,8 @@ def _e5_cache_capture(self, scheduler_output, attn_metadata, spec_common,
     if logits_indices is not None and spec_decode_metadata is not None:
         state["logits_indices"] = logits_indices
         state["spec_md"] = spec_decode_metadata
-        state["cu8"] = np.array([self.num_spec_tokens + 1], dtype=np.int32)
+        state["cu8"] = (np.arange(1, _n + 1, dtype=np.int32)
+                        * (self.num_spec_tokens + 1))
         # Constant composite gather index: the full path derives draft ids
         # as input_ids.gpu[logits_indices][target_logits_indices + 1].
         state["draft_src_idx"] = logits_indices[
@@ -678,12 +704,15 @@ def _e5_state_fp(self):
     tables (state-block transition, block append) — those rounds must take
     the full-rebuild path."""
     try:
-        req_id = self.input_batch.req_ids[0]
-        state_idx = self.mamba_state_idx.get(req_id)
-        block_lens = tuple(
-            len(b) for b in self.requests[req_id].block_ids
-        )
-        return (req_id, state_idx, block_lens)
+        num_reqs = self.input_batch.num_reqs
+        fp = []
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            state_idx = self.mamba_state_idx.get(req_id)
+            block_lens = tuple(
+                len(b) for b in self.requests[req_id].block_ids
+            )
+            fp.append((req_id, state_idx, block_lens))
+        return tuple(fp)
     except Exception:
         return None
 
@@ -700,14 +729,16 @@ def _e5_fast_prepare_v2(self, scheduler_output):
     """
     cache = self._e5_cache_state
     so = scheduler_output
-    num_reqs = 1
-    total = self.num_spec_tokens + 1
+    num_reqs = int(cache.get("num_reqs", 1))
+    k1 = self.num_spec_tokens + 1
+    total = k1 * num_reqs
     self._ddtree_parent_metadata = None
 
-    base = int(self.input_batch.num_computed_tokens_cpu[0])
-    pos_np = base + np.arange(total, dtype=np.int64)
+    bases = self.input_batch.num_computed_tokens_cpu[:num_reqs].astype(
+        np.int64, copy=True)
+    pos_np = (bases[:, None] + np.arange(k1, dtype=np.int64)[None, :]).reshape(-1)
     self._current_positions_cpu_sidecar = pos_np
-    req_idx_np = np.zeros(total, dtype=np.int64)
+    req_idx_np = np.repeat(np.arange(num_reqs, dtype=np.int64), k1)
     self._current_req_indices_cpu_sidecar = req_idx_np
 
     # Block table H2D (content changes only when a block is appended).
@@ -719,10 +750,13 @@ def _e5_fast_prepare_v2(self, scheduler_output):
     if self.uses_xdrope_dim > 0:
         self._calc_xdrope_positions(so)
 
-    # Optimistic seq lens + discard mask.
-    self.optimistic_seq_lens_cpu[0] = base + total
-    num_tokens_now = self.requests[self.input_batch.req_ids[0]].num_tokens
-    self.discard_request_mask.np[0] = (base + total) < num_tokens_now
+    # Optimistic seq lens + discard mask (per request).
+    opt_np = bases + k1
+    self.optimistic_seq_lens_cpu[:num_reqs] = torch.from_numpy(opt_np).to(
+        self.optimistic_seq_lens_cpu.dtype)
+    for _i, _rid in enumerate(self.input_batch.req_ids[:num_reqs]):
+        self.discard_request_mask.np[_i] = (
+            int(opt_np[_i]) < self.requests[_rid].num_tokens)
     self._copy_buffer_to_gpu(self.discard_request_mask, num_reqs)
 
     # NOTE: hoisting the flash-group build before this sync was measured
@@ -878,15 +912,17 @@ def _e5_fast_prepare_v2(self, scheduler_output):
 
 def _e5_prep_roots(self) -> dict:
     cache = self._e5_cache_state
+    _n = int(cache.get("num_reqs", 1))
+    _tot = _n * (self.num_spec_tokens + 1)
     roots = {
-        "input_ids8": self.input_ids.gpu[:8],
-        "pos1d": self.positions[:8],
-        "seq_lens2": self.seq_lens[:2],
-        "opt2": self.optimistic_seq_lens_cpu[:2],
-        "discard": self.discard_request_mask.np[:1].copy(),
-        "num_computed1": self.num_computed_tokens[:1],
-        "accepted1": self.num_accepted_tokens.gpu[:1],
-        "selectors1": self.spec_state_slot_selectors.gpu[:1],
+        "input_ids8": self.input_ids.gpu[:_tot],
+        "pos1d": self.positions[:_tot],
+        "seq_lens2": self.seq_lens[:_n + 1],
+        "opt2": self.optimistic_seq_lens_cpu[:_n + 1],
+        "discard": self.discard_request_mask.np[:_n].copy(),
+        "num_computed1": self.num_computed_tokens[:_n],
+        "accepted1": self.num_accepted_tokens.gpu[:_n],
+        "selectors1": self.spec_state_slot_selectors.gpu[:_n],
         "sidecar_pos": self._current_positions_cpu_sidecar,
         "spec_md": cache["spec_md"],
         "logits_idx": cache["logits_indices"],
@@ -894,12 +930,12 @@ def _e5_prep_roots(self) -> dict:
     try:
         for gid in range(len(self.kv_cache_config.kv_cache_groups)):
             roots[f"slot{gid}"] = (
-                self.input_batch.block_table[gid].slot_mapping.gpu[:8]
+                self.input_batch.block_table[gid].slot_mapping.gpu[:_tot]
             )
     except Exception:
         pass
     if self.uses_xdrope_dim > 0:
-        roots["xdrope"] = self.xdrope_positions.gpu[:, :8]
+        roots["xdrope"] = self.xdrope_positions.gpu[:, :_tot]
     return roots
 
 
@@ -1250,7 +1286,8 @@ def _e5_apply_ints(self) -> None:
     batch=1 — mamba_state_idx and block_ids are current because
     update_states and preprocess_mamba still run)."""
     cache = self._e5_cache_state
-    opt = int(self.optimistic_seq_lens_cpu[0])
+    n_reqs = int(cache.get("num_reqs", 1))
+    opt = int(self.optimistic_seq_lens_cpu[:n_reqs].max())
     for obj in [cache["spec_common"], *cache["groups"]]:
         if isinstance(getattr(obj, "max_seq_len", None), int):
             try:
@@ -1259,9 +1296,7 @@ def _e5_apply_ints(self) -> None:
                 pass
     acc = self.num_accepted_tokens.gpu
     sel = self.spec_state_slot_selectors.gpu
-    req_id = self.input_batch.req_ids[0]
-    state_idx = self.mamba_state_idx.get(req_id)
-    req_state = self.requests[req_id]
+    req_ids = list(self.input_batch.req_ids[:n_reqs])
     for obj, gid in zip(cache["groups"], cache["gids"]):
         t = getattr(obj, "num_accepted_tokens", None)
         if isinstance(t, torch.Tensor):
@@ -1272,16 +1307,23 @@ def _e5_apply_ints(self) -> None:
             n = min(t.shape[0], sel.shape[0])
             t[:n].copy_(sel[:n], non_blocking=True)
         t = getattr(obj, "spec_state_indices_tensor", None)
-        if isinstance(t, torch.Tensor) and state_idx is not None \
-                and gid is not None:
-            block_ids = req_state.block_ids[gid]
+        if isinstance(t, torch.Tensor) and gid is not None:
+            # Same rule as the original single-request version: a request
+            # without a tracked mamba state slot leaves its row untouched.
             width = t.shape[-1]
-            row = [
-                block_ids[state_idx + off]
-                if 0 <= state_idx + off < len(block_ids) else -1
-                for off in range(width)
-            ]
-            t[0].copy_(torch.tensor(row, dtype=t.dtype))
+            for i, req_id in enumerate(req_ids):
+                if i >= int(t.shape[0]):
+                    break
+                state_idx = self.mamba_state_idx.get(req_id)
+                if state_idx is None:
+                    continue
+                block_ids = self.requests[req_id].block_ids[gid]
+                row = [
+                    block_ids[state_idx + off]
+                    if 0 <= state_idx + off < len(block_ids) else -1
+                    for off in range(width)
+                ]
+                t[i].copy_(torch.tensor(row, dtype=t.dtype))
 
 
 def _e5_md_roots(attn_md, spec_common):
@@ -2347,8 +2389,11 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        # PP: only the last stage owns a drafter; earlier stages keep None so
+        # attribute access never raises on the non-sampling ranks.
+        self.drafter = None
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
+            self.drafter: (  # type: ignore[no-redef]
                 NgramProposer  # noqa: F823
                 | NgramProposerGPU
                 | SuffixDecodingProposer
@@ -8685,6 +8730,24 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
+        # v100-skinny (2026-09-04): a request still in prefill can present
+        # exactly uniform_decode_query_len tokens (a (k+1)-token prompt, or a
+        # chunked-prefill tail of that size) and pass the shape test above.
+        # It would then replay the speculative-verify FULL graph with stale
+        # persistent attention/GDN metadata and emit garbage (measured: every
+        # 4-token prompt at k=3, 5-token at k=4). A prefill batch is never a
+        # uniform decode; only the runtime path (force_uniform_decode is None)
+        # is affected, capture keeps its explicit override.
+        if (
+            uniform_decode
+            and force_uniform_decode is None
+            and num_reqs > 0
+            and self.uniform_decode_query_len > 1
+        ):
+            _nc = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            _np_ = self.input_batch.num_prompt_tokens[:num_reqs]
+            if bool((_nc < _np_).any()):
+                uniform_decode = False
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = (
@@ -9928,6 +9991,10 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                # PP+async: earlier stages scatter next step's draft tokens
+                # from a GPU tensor too, so ship them the same way the sampled
+                # ids were shipped in _pp_broadcast_prev_sampled_token_ids.
+                self._pp_broadcast_draft_token_ids()
                 self._sm70_mtp_profile_finish(
                     None if mtp_profile_ctx is None else mtp_profile_ctx["events"],
                     "draft_total",
@@ -10297,6 +10364,26 @@ class GPUModelRunner(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
 
+    def _pp_broadcast_draft_token_ids(self) -> None:
+        """PP+async: broadcast next step's draft tokens (GPU) from the last
+        stage, mirroring _pp_broadcast_prev_sampled_token_ids. Receivers
+        allocate [num_reqs, num_spec_tokens] int32, so send exactly that."""
+        if not self.use_async_scheduling or self.num_spec_tokens <= 0:
+            return
+        pp = get_pp_group()
+        if self.broadcast_pp_output or pp.world_size <= 1 or not pp.is_last_rank:
+            return
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        payload = torch.full(
+            (num_reqs, self.num_spec_tokens), -1, dtype=torch.int32, device=self.device
+        )
+        d = self._draft_token_ids
+        if isinstance(d, torch.Tensor) and d.numel() == num_reqs * self.num_spec_tokens:
+            payload.copy_(d.reshape(num_reqs, self.num_spec_tokens).to(torch.int32))
+        torch.distributed.broadcast(payload, src=pp.rank, group=pp.device_group)
+
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
@@ -10308,6 +10395,15 @@ class GPUModelRunner(
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         self.input_batch.prev_sampled_token_ids = recv
+        if self.num_spec_tokens > 0:
+            recv_draft = torch.empty(
+                (num_reqs, self.num_spec_tokens), dtype=torch.int32, device=self.device
+            )
+            if not self._is_all_reqs_chunked_prefill():
+                torch.distributed.broadcast(
+                    recv_draft, src=pp.last_rank, group=pp.device_group
+                )
+            self._draft_token_ids = recv_draft
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -11761,7 +11857,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and get_pp_group().is_last_rank and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -11835,9 +11931,12 @@ class GPUModelRunner(
         )
         _sm70_profile_trace(
             "_dummy_run return hidden_shape=%s sampled_count=%s",
-            tuple(hidden_states.shape),
+            tuple(getattr(hidden_states, "shape", ())),
             len(logit_indices),
         )
+        if not get_pp_group().is_last_rank:
+            # PP: non-last stages return IntermediateTensors; nothing to sample.
+            return hidden_states, hidden_states
         return hidden_states, hidden_states[logit_indices_device]
 
     @torch.inference_mode()
@@ -12108,8 +12207,8 @@ class GPUModelRunner(
         )
         _sm70_profile_trace(
             "profile_run dummy_run exit hidden_shape=%s last_hidden_shape=%s",
-            tuple(hidden_states.shape),
-            tuple(last_hidden_states.shape),
+            tuple(getattr(hidden_states, "shape", ())),
+            tuple(getattr(last_hidden_states, "shape", ())),
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -12731,7 +12830,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -12784,7 +12883,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):
@@ -13248,6 +13347,7 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
+            and get_pp_group().is_last_rank
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)

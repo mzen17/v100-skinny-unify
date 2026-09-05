@@ -616,6 +616,20 @@ here would *improve* if they were closed.
   the checkpoint-native code stash, which production frees rather than hold
   two packed copies of every weight. Prefill band only; the V100 WMMA plateau
   there is structural anyway. FP8 is unaffected — `qpn8-chunked` covers 17–96.
+- **Prefill on a PCIe box is all-reduce-bound, not GEMM-bound.** On the
+  2-GPU host (no P2P, one card at PCIe gen3 x8) NCCL all-reduce is 41% of
+  prefill GPU time while the cuBLAS GEMMs already run at ~88 TFLOPS. A fused
+  QPN8 unprepack+dequant kernel (`qpn8_dequant`, bit-identical) lifted TP2
+  prefill 1029 -> 1208 tok/s at 3.6k; PP=2 (spec off) reaches 1650 tok/s at
+  14.5k by removing the all-reduce entirely, at the cost of decode. Details
+  and the recipe: [`results/prefill_20260904.md`](results/prefill_20260904.md).
+- **Decode on the same box** (same file): a single-kernel 2-rank all-reduce
+  through pinned host memory (`kernels/skinny_ar.cu`, exact, 27 us vs NCCL's
+  44) lifted decode 97.5 -> 107 tok/s; fusing it with the residual add and
+  Gemma RMSNorm via the fork's own fusion pass, plus a one-launch q/k/v split
+  and a small-N GEMV, cut per-round GPU kernel time 33.8 -> 27.4 ms, after
+  which the round is host-bound at ~30 ms. The fusion and GEMV are one-ulp
+  changes and ship off by default; the exact pieces are on.
 - **The FP8 chunked path re-reads the weight stream once per 8 rows**, so
   useful bandwidth at M=32 is about a quarter of the M ≤ 8 figure — time is
   linear in M (113.1 µs at M=32, 223.5 at M=64, i.e. 4 and 8
@@ -639,6 +653,7 @@ rather than redefines.
 | decode-partition fix | [`results/partition_fix_20260819.md`](results/partition_fix_20260819.md) | [`benchmarks/v11_suite.py`](benchmarks/v11_suite.py) |
 | decode vs live context | [`results/ctx_depth_20260819.md`](results/ctx_depth_20260819.md) | [llama-benchy](https://github.com/eugr/llama-benchy) |
 | FP16-KV policy (+4.82 ms/round) | [`results/mixed_regression_closed_20260818.md`](results/mixed_regression_closed_20260818.md) | [`benchmarks/v11_suite.py`](benchmarks/v11_suite.py) |
+| prefill profile, fused QPN8 dequant, PP=2 prefill mode, stock 1.5.0 comparison (2-GPU box) | [`results/prefill_20260904.md`](results/prefill_20260904.md) | streaming TTFT probe described in the file |
 
 The harnesses above are portable and take their paths from the environment.
 The per-experiment boot drivers that orchestrated these runs are

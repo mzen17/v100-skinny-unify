@@ -236,6 +236,8 @@ VLLM_SKINNY_LMHEAD_NATIVE=1 \
 VLLM_SKINNY_DROP_CT=1 \
 VLLM_SKINNY_QPN_UNIFY="${VLLM_SKINNY_QPN_UNIFY:-1}" \
 VLLM_SKINNY_NVFP4_SRC="$REPO_ROOT/kernels/skinny_kernels.cu" \
+VLLM_SKINNY_AR_SRC="$REPO_ROOT/kernels/skinny_ar.cu" \
+VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION="${VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION:-0}" \
 VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT=0 \
 VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD=1 \
 VLLM_SM70_QPN8_MT2=1 \
@@ -259,6 +261,7 @@ setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2],\"custom_ops\":[\"none\",\"+rms_norm_gated\"]}" \
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"draft_sample_method\":\"greedy\",\"use_local_argmax_reduction\":true}" \
+  ${EXTRA_ARGS:-} \
   --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PIDFILE"
@@ -386,14 +389,38 @@ INELIGIBLE=$(grep -c "QPN8_CENSUS_LOAD.*eligible=NO" "$LOG" || true)
 # The launch claim is an EXACT number: 2 protected modules per layer x 64
 # layers x 4 ranks = 512. "Any positive count" would pass a boot that silently
 # dropped modules, which is the failure this gate exists to catch.
-CENSUS_EXPECTED=$((128 * TP))
+# QPN8_PER_RANK overrides the per-rank module count for checkpoints whose FP8
+# modules were partly requantized to NVFP4 (see results/, 2026-09-04).
+CENSUS_EXPECTED=$(( ${QPN8_PER_RANK:-128} * TP ))
 [ "${CENSUS:-0}" = "$CENSUS_EXPECTED" ] && [ "${INELIGIBLE:-0}" = 0 ] \
   && gate "QPN8 census exactly $CENSUS_EXPECTED, 0 ineligible" ok \
   || gate "QPN8 census exactly $CENSUS_EXPECTED" fail "census=$CENSUS ineligible=$INELIGIBLE"
 
-grep -q "route=qpn8" "$LOG" \
-  && gate "QPN8 dispatched at run time" ok \
-  || gate "QPN8 dispatched at run time" fail "no qpn8 route observed"
+if [ "$CENSUS_EXPECTED" = 0 ]; then
+  gate "QPN8 dispatch gate skipped (QPN8_PER_RANK=0: checkpoint has no FP8 modules)" ok
+else
+  grep -q "route=qpn8" "$LOG" \
+    && gate "QPN8 dispatched at run time" ok \
+    || gate "QPN8 dispatched at run time" fail "no qpn8 route observed"
+fi
+
+# ---- CPU pinning (2026-09-04) ------------------------------------------
+# Both TP workers and the engine core each saturate a core during decode and
+# the all-reduce absorbs whatever launch skew the scheduler adds between them.
+# Pinning each to its own pair of cores measured +1.1% decode (interleaved
+# A/B, 99.3/99.4 -> 100.4/100.6 tok/s). Skipped on hosts with < 8 CPUs.
+# SKINNY_PIN=0 disables it.
+if [ "${SKINNY_PIN:-1}" = 1 ] && [ "$(nproc)" -ge 8 ] && command -v taskset >/dev/null; then
+  W=($(ps -eo pid,comm | awk '$2 ~ /VLLM::Worker/ {print $1}'))
+  EC=$(ps -eo pid,comm | awk '$2 ~ /VLLM::EngineCor/ {print $1}' | head -1)
+  if [ "${#W[@]}" -ge 2 ] && [ -n "$EC" ]; then
+    taskset -a -pc 2,3 "${W[0]}" >/dev/null 2>&1
+    taskset -a -pc 4,5 "${W[1]}" >/dev/null 2>&1
+    taskset -a -pc 6,7 "$EC" >/dev/null 2>&1
+    taskset -a -pc 0,1 "$SERVER_PID" >/dev/null 2>&1
+    echo "==> pinned workers ${W[0]},${W[1]} -> cpus 2-3/4-5, engine $EC -> 6-7, api -> 0-1"
+  fi
+fi
 
 if [ "$FAIL" = 0 ]; then
   echo "==> READY on port $PORT (pid $(cat "$PIDFILE")) — all gates passed"

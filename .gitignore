@@ -24,3 +24,4 @@ vendor/flash_attn_v100.installed.bak/
 
 # Serve-time scratch
 serve.pid
+compiled_cache.db

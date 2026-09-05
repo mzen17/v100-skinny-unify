@@ -42,6 +42,11 @@ deploy torch_utils.py       vllm/utils/torch_utils.py
 deploy attention.py         vllm/model_executor/layers/attention/attention.py
 deploy custom_all_reduce.py vllm/distributed/device_communicators/custom_all_reduce.py
 deploy flash_attn_v100.py   vllm/v1/attention/backends/flash_attn_v100.py
+deploy qwen3_5_mtp.py       vllm/model_executor/models/qwen3_5_mtp.py
+deploy cuda_communicator.py vllm/distributed/device_communicators/cuda_communicator.py
+deploy qwen_gdn_linear_attn.py vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+deploy qwen3_5.py           vllm/model_executor/models/qwen3_5.py
+deploy allreduce_rms_fusion.py vllm/compilation/passes/fusion/allreduce_rms_fusion.py
 # sm70_native_round.py is deliberately NOT installed — experimental, inert.
 
 # ------------------------------------------------- flash_attn_v100 (E4M3 KV)

@@ -534,6 +534,14 @@ _SM70_QPN8_MT2 = _os.environ.get("VLLM_SM70_QPN8_MT2", "1") == "1"
 # and the server happily accepted 98.8% of drafts at every position.
 _SM70_QPN8_MT2_TABLE = {(4096, 5120): (16, 3), (5120, 1536): (16, 3),
                         (3584, 5120): (16, 3)}
+# MTT (2026-09-05): MT row-tiles x T=2 N-tiles per warp with the A fragments
+# loaded once per k-group for both tiles (skinny_fp8_qpn8_mtt). Above 8 rows
+# the m8n8k4 loop was bound by A re-read traffic (every N-tile CTA streams
+# the whole x through L2), not by mma issue; sharing A across two tiles
+# brings M=16 to ~1.3x the M=8 cost instead of 2x. Uses the layer's own
+# (splitk, nacc) so every row is bit-identical to the M<=8 qpn8 path (the
+# fast decoder is exact). Covers M 9..32; VLLM_SM70_QPN8_MTT=0 restores MT2.
+_SM70_QPN8_MTT = _os.environ.get("VLLM_SM70_QPN8_MTT", "1") == "1"
 
 
 def _sm70_fp8_apply(layer, x, bias):
@@ -606,13 +614,33 @@ def _sm70_qpn8_unpack(packed, n, k):
     return out
 
 
+def _sm70_qpn8_dense_weight(ext, codes, tscale, n, k, dtype):
+    """Transient dense fp16 [n,k] from the packed QPN8 buffer.
+
+    Fast path (2026-09-03): the extension's fused qpn8_dequant does the
+    unprepack + e4m3->fp16 + tile-scale multiply in ONE memory-bound pass.
+    The torch body below is three passes plus a ~300 MB int64 gather index
+    per call, and it ran once per FP8 module per prefill chunk: measured
+    2.6-3.0 ms per call on the GDN/attention projections against 0.2-0.5 ms
+    fused (5.5x), bit-identical output (benchmarks in the session notes).
+    """
+    if dtype == torch.float16 and ext is not None and hasattr(ext, "qpn8_dequant"):
+        return ext.qpn8_dequant(codes, tscale, n, k)
+    w8 = _sm70_qpn8_unpack(codes, n, k)
+    wf = w8.view(torch.float8_e4m3fn).to(dtype)
+    scale = tscale.repeat_interleave(32).to(dtype) / 256.0
+    return wf * scale.unsqueeze(1)
+
+
 @_sm70_custom_op("sm70_fp8::qpn8_linear", mutates_args=())
 def _sm70_qpn8_linear(x: torch.Tensor, codes: torch.Tensor,
                       tscale: torch.Tensor, n: int, k: int, splitk: int,
                       nacc: int) -> torch.Tensor:
     from vllm.model_executor.kernels.linear.nvfp4.marlin import _get_skinny_ext
     ext = _get_skinny_ext()
+    _mtt_ok = _SM70_QPN8_MTT and hasattr(ext, "gemm_qpn8_mtt")
     _rt = ("qpn8" if x.shape[0] <= 8
+           else "qpn8-mtt" if (_mtt_ok and x.shape[0] <= 32)
            else ("qpn8-mt2" if (_SM70_QPN8_MT2 and hasattr(ext, "gemm_qpn8_mt2"))
                  else "qpn8-chunked") if x.shape[0] <= 16
            else "qpn8-chunked" if x.shape[0] <= _SM70_QPN8_CHUNK_MAX
@@ -644,6 +672,11 @@ def _sm70_qpn8_linear(x: torch.Tensor, codes: torch.Tensor,
     # Ragged tails (M=17 -> 8+8+1, M=20 -> 8+8+4) are validated to the same
     # 2.75e-4 as the native path in benchmarks/qpn8_chunk_validate.py.
     # Shapes stay static per M, so graph capture is unaffected.
+    if m <= 32 and _mtt_ok:
+        _mt = 2 if m <= 16 else 4
+        _sp = min(int(splitk), 16 if _mt == 2 else 8)
+        _na = int(nacc) if int(nacc) >= 3 else int(nacc) + 2  # fast decoder
+        return ext.gemm_qpn8_mtt(x, codes, tscale, n, _sp, _na, _mt, 2)
     if m <= 16 and _SM70_QPN8_MT2 and hasattr(ext, "gemm_qpn8_mt2"):
         msp, mna = _SM70_QPN8_MT2_TABLE.get((int(n), int(k)), (splitk, nacc))
         return ext.gemm_qpn8_mt2(x, codes, tscale, n, msp, mna)
@@ -652,10 +685,8 @@ def _sm70_qpn8_linear(x: torch.Tensor, codes: torch.Tensor,
                               splitk, nacc) for i in range(0, m, 8)]
         return torch.cat(outs, 0)
     # prefill: reconstruct transiently from the packed codes (never persisted)
-    w8 = _sm70_qpn8_unpack(codes, n, k)
-    wf = w8.view(torch.float8_e4m3fn).to(x.dtype)
-    scale = tscale.repeat_interleave(32).to(x.dtype) / 256.0
-    return torch.nn.functional.linear(x, wf * scale.unsqueeze(1))
+    return torch.nn.functional.linear(x, _sm70_qpn8_dense_weight(
+        ext, codes, tscale, n, k, x.dtype))
 
 
 @_sm70_qpn8_linear.register_fake
@@ -668,11 +699,9 @@ def _sm70_qpn8_prefill(x: torch.Tensor, codes: torch.Tensor,
                        tscale: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """Prefill until the tiled QPN8 kernel lands: reconstruct from the packed
     codes (transient, never persisted) rather than keeping a second copy."""
-    w8 = _sm70_qpn8_unpack(codes, n, k)
-    wf = w8.view(torch.float8_e4m3fn).to(x.dtype)
-    scale = tscale.repeat_interleave(32).to(x.dtype) / 256.0
-    wf = wf * scale.unsqueeze(1)
-    return torch.nn.functional.linear(x, wf)
+    from vllm.model_executor.kernels.linear.nvfp4.marlin import _get_skinny_ext
+    return torch.nn.functional.linear(x, _sm70_qpn8_dense_weight(
+        _get_skinny_ext(), codes, tscale, n, k, x.dtype))
 
 
 @_sm70_qpn8_prefill.register_fake

@@ -2337,6 +2337,690 @@ std::vector<torch::Tensor> skinny_qpn_unprepack(torch::Tensor qc,
   return {codes, scales};
 }
 
+
+// ---------------------------------------------------------------------------
+// QPN8 fused unprepack + dequant: packed FP8 buffer -> dense fp16 [n,k].
+//
+// Replaces the Python prefill reconstruct (_sm70_qpn8_unpack advanced-index
+// gather + fp8->fp16 cast + scale multiply: three full passes and a ~300 MB
+// int64 index transient per call) with one memory-bound pass. Layout is the
+// host _sm70_qpn8_prepack contract: [tile][group][lane][16 B], lane -> column
+// via the QPN column map, byte j -> k = group*16 + KORDER8[j].
+//
+// Numerics: byte -> exact fp16 (value * 2^-8 via the shift decoder, exact for
+// every finite e4m3 incl. denormals), then ONE fp32 multiply by tscale
+// (which carries the *256 fold) and one rounding to fp16 --
+// the same single rounding the torch path performs, so output is
+// bit-identical to `w8.view(e4m3).to(fp16) * (tscale/256)`.
+__constant__ int QPN8_KORDER[16] = {0, 2, 4, 6, 1, 3, 5, 7,
+                                    8, 10, 12, 14, 9, 11, 13, 15};
+
+__global__ void skinny_fp8_qpn8_dequant(const uint8_t *__restrict__ codes,
+                                        const float *__restrict__ tscale,
+                                        half *__restrict__ out, int n, int k) {
+  const int groups = k >> 4;
+  const long tile = blockIdx.x;
+  const int group_base = blockIdx.y * 32;
+  // [row][gslot][byte]; gslot dim padded to 33 so the read phase's
+  // permuted-row 16 B stores land on distinct banks (row stride 528 B
+  // = 132 words, 132 mod 32 = 4 -> conflict-free per 8-lane phase).
+  __shared__ __align__(16) uint8_t smem[32][33][16];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int gslot_r = tid >> 5;
+  const int group_r = group_base + gslot_r;
+  if (group_r < groups) {
+    const int col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    const uint4 v = *reinterpret_cast<const uint4 *>(
+        codes + ((tile * groups + group_r) * 32 + lane) * 16);
+    *reinterpret_cast<uint4 *>(&smem[col][gslot_r][0]) = v;
+  }
+  __syncthreads();
+
+  const int row = tid >> 5;
+  const int gslot_w = tid & 31;
+  const int group_w = group_base + gslot_w;
+  if (group_w < groups) {
+    // decoder yields value*2^-8 and tscale carries the *256 fold. Round the
+    // scale through fp16 first: the shipped torch path does
+    // fp16(tscale)/256, and matching that rounding keeps the output
+    // byte-identical to it.
+    const float s = __half2float(__float2half(tscale[tile]));
+    const uint8_t *b = &smem[row][gslot_w][0];
+    __align__(16) half o[16];
+#pragma unroll
+    for (int j = 0; j < 16; j++) {
+      const unsigned byte = b[j];
+      const unsigned hbits = ((byte & 0x80u) << 8) | ((byte & 0x7Fu) << 7);
+      const half h = __ushort_as_half((unsigned short)hbits);
+      o[QPN8_KORDER[j]] = __float2half(__half2float(h) * s);
+    }
+    int4 *dst = reinterpret_cast<int4 *>(out + (tile * 32 + row) * (long)k +
+                                         (long)group_w * 16);
+    dst[0] = *reinterpret_cast<const int4 *>(&o[0]);
+    dst[1] = *reinterpret_cast<const int4 *>(&o[8]);
+  }
+}
+
+torch::Tensor skinny_qpn8_dequant(torch::Tensor codes, torch::Tensor tscale,
+                                  int64_t n, int64_t k) {
+  TORCH_CHECK(codes.is_cuda() && codes.dtype() == torch::kUInt8 &&
+              codes.is_contiguous());
+  TORCH_CHECK(tscale.is_cuda() && tscale.dtype() == torch::kFloat32 &&
+              tscale.is_contiguous());
+  TORCH_CHECK(n % 32 == 0 && k % 16 == 0, "n%32, k%16");
+  TORCH_CHECK(codes.numel() == (long)n * k, "codes size");
+  TORCH_CHECK(tscale.numel() == n / 32, "tscale size");
+  auto out = torch::empty({n, k}, codes.options().dtype(torch::kFloat16));
+  const int tiles = (int)(n / 32);
+  const int groups = (int)(k >> 4);
+  const int group_blocks = (groups + 31) / 32;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  skinny_fp8_qpn8_dequant<<<dim3(tiles, group_blocks), dim3(1024), 0,
+                            stream>>>(
+      codes.data_ptr<uint8_t>(), tscale.data_ptr<float>(),
+      reinterpret_cast<half *>(out.data_ptr<at::Half>()), (int)n, (int)k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// Small-N fp16 GEMV for the GDN `in_proj_ba` projection: x[M,K] * w[N,K]^T,
+// M <= 16, N <= 128 (per-rank N is 48 here). cuBLAS answers this shape with a
+// wmma tile kernel plus a split-K reduce (13.6 us for a 480 KB weight read).
+// One block per output column, MAXM rows as compile-time registers, 16 B
+// loads, fp32 accumulation. K must be a multiple of 8*128 = 1024.
+template <int MAXM>
+__global__ void __launch_bounds__(128)
+skinny_gemv_f16_smalln(const half *__restrict__ x, const half *__restrict__ w,
+                       half *__restrict__ out, int M, int N, int K) {
+  const int n = blockIdx.x;
+  if (n >= N) return;
+  const int tid = threadIdx.x;
+  const int4 *wrow = reinterpret_cast<const int4 *>(w + (size_t)n * K);
+  const int K8 = K >> 3;
+  float acc[MAXM];
+#pragma unroll
+  for (int m = 0; m < MAXM; m++) acc[m] = 0.f;
+  for (int i = tid; i < K8; i += 128) {
+    const int4 wv = __ldg(wrow + i);
+    int4 xv[MAXM];
+#pragma unroll
+    for (int m = 0; m < MAXM; m++)
+      xv[m] = (m < M) ? __ldg(reinterpret_cast<const int4 *>(x + (size_t)m * K) + i)
+                      : make_int4(0, 0, 0, 0);
+    const half2 *wh = reinterpret_cast<const half2 *>(&wv);
+#pragma unroll
+    for (int m = 0; m < MAXM; m++) {
+      const half2 *xh = reinterpret_cast<const half2 *>(&xv[m]);
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const float2 a = __half22float2(xh[j]);
+        const float2 b = __half22float2(wh[j]);
+        acc[m] = fmaf(a.x, b.x, fmaf(a.y, b.y, acc[m]));
+      }
+    }
+  }
+  __shared__ float red[MAXM][4];
+#pragma unroll
+  for (int m = 0; m < MAXM; m++) {
+    float v = acc[m];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if ((tid & 31) == 0) red[m][tid >> 5] = v;
+  }
+  __syncthreads();
+  if (tid < M) {
+    const float v = red[tid][0] + red[tid][1] + red[tid][2] + red[tid][3];
+    out[(size_t)tid * N + n] = __float2half(v);
+  }
+}
+
+torch::Tensor skinny_gemv_f16(torch::Tensor x, torch::Tensor w) {
+  TORCH_CHECK(x.is_cuda() && w.is_cuda() && x.dtype() == torch::kFloat16 &&
+              w.dtype() == torch::kFloat16 && x.is_contiguous() && w.is_contiguous());
+  const int M = (int)x.size(0), K = (int)x.size(1), N = (int)w.size(0);
+  TORCH_CHECK(w.size(1) == K && M >= 1 && M <= 16 && K % 1024 == 0, "shape");
+  auto out = torch::empty({M, N}, x.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const half *xp = reinterpret_cast<const half *>(x.data_ptr<at::Half>());
+  const half *wp = reinterpret_cast<const half *>(w.data_ptr<at::Half>());
+  half *op = reinterpret_cast<half *>(out.data_ptr<at::Half>());
+  if (M == 1) skinny_gemv_f16_smalln<1><<<N, 128, 0, stream>>>(xp, wp, op, M, N, K);
+  else if (M <= 2) skinny_gemv_f16_smalln<2><<<N, 128, 0, stream>>>(xp, wp, op, M, N, K);
+  else if (M <= 4) skinny_gemv_f16_smalln<4><<<N, 128, 0, stream>>>(xp, wp, op, M, N, K);
+  else if (M <= 8) skinny_gemv_f16_smalln<8><<<N, 128, 0, stream>>>(xp, wp, op, M, N, K);
+  else skinny_gemv_f16_smalln<16><<<N, 128, 0, stream>>>(xp, wp, op, M, N, K);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// GDN q/k/v split: mixed_qkv[M, q+k+v] (any row stride, unit column stride)
+// -> three contiguous [M, w] tensors. Replaces rearrange_mixed_qkv's three
+// strided reshape copies plus a cat (four launches, ~10 us per GDN layer)
+// with one 16 B-vectorised copy. Widths must be multiples of 8.
+__global__ void skinny_gdn_split3_kernel(const half *__restrict__ src, long src_stride,
+                                  half *__restrict__ q, half *__restrict__ k,
+                                  half *__restrict__ v, int M, int wq, int wk, int wv) {
+  const int total8 = (wq + wk + wv) >> 3;
+  const int row = blockIdx.y;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total8; i += gridDim.x * blockDim.x) {
+    const int col = i << 3;
+    const int4 val = *reinterpret_cast<const int4 *>(src + (size_t)row * src_stride + col);
+    half *dst;
+    int off;
+    if (col < wq) { dst = q + (size_t)row * wq; off = col; }
+    else if (col < wq + wk) { dst = k + (size_t)row * wk; off = col - wq; }
+    else { dst = v + (size_t)row * wv; off = col - wq - wk; }
+    *reinterpret_cast<int4 *>(dst + off) = val;
+  }
+}
+
+std::vector<torch::Tensor> skinny_gdn_split3(torch::Tensor x, int64_t wq, int64_t wk, int64_t wv) {
+  TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kFloat16 && x.dim() == 2 && x.stride(1) == 1);
+  TORCH_CHECK(x.size(1) == wq + wk + wv && wq % 8 == 0 && wk % 8 == 0 && wv % 8 == 0, "widths");
+  TORCH_CHECK((x.stride(0) % 8) == 0 && (reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0, "alignment");
+  const int M = (int)x.size(0);
+  auto opts = x.options();
+  auto q = torch::empty({M, wq}, opts), k = torch::empty({M, wk}, opts), v = torch::empty({M, wv}, opts);
+  const int total8 = (int)((wq + wk + wv) >> 3);
+  const int threads = 256;
+  const int bx = (total8 + threads - 1) / threads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  skinny_gdn_split3_kernel<<<dim3(bx, M), threads, 0, stream>>>(
+      reinterpret_cast<const half *>(x.data_ptr<at::Half>()), (long)x.stride(0),
+      reinterpret_cast<half *>(q.data_ptr<at::Half>()), reinterpret_cast<half *>(k.data_ptr<at::Half>()),
+      reinterpret_cast<half *>(v.data_ptr<at::Half>()), M, (int)wq, (int)wk, (int)wv);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {q, k, v};
+}
+
+
+// ---------------------------------------------------------------------------
+// QPN2 MT (2026-09-05): MT m8n8k4 row-tiles against ONE NVFP4 weight stream.
+// qpn2 is DRAM-bound at M<=8; M 9..16 used to fall to skinny_nvfp4_qpn<2>
+// (~2x slower: the README's MT=2 gap) and M 17..32 to a per-forward dense
+// reconstruct whose transient OOMs the 16 GB card at 8 concurrent k=3
+// streams. This is the NVFP4 twin of skinny_fp8_qpn8_mt2, generalised to
+// MT in {2, 4}: the B fragment (codes + group scale) is decoded once per
+// group and MT row-tiles of A are issued against it, so the weight traffic
+// is that of a single M<=8 call. Costs: MT*NACC*8 accumulators per lane
+// and a split-K staging buffer of SPLITK*MT KB (kept <= 32 KB: MT=2 admits
+// SPLITK<=16, MT=4 admits SPLITK<=8).
+template <int SPLITK, int NACC, int MT>
+__global__ void skinny_nvfp4_qpn2_mt(const uint8_t *__restrict__ bcodes,
+                                     const uint8_t *__restrict__ bscales,
+                                     const half *__restrict__ x,
+                                     half *__restrict__ y, int N, int K,
+                                     int M, float gscale) {
+  __shared__ float cs[SPLITK][MT * 256];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq;
+  const uint2 *cb = reinterpret_cast<const uint2 *>(bcodes) +
+                    (size_t)tile * G * 32 + lane;
+  const uint8_t *sb = bscales + (size_t)tile * G * 32 + lane;
+
+  const half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float c[MT][NACC][8];
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int a = 0; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][a][i] = 0.f;
+
+#pragma unroll 2
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+    const half2 sc2 =
+        __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+    half2 b[8];
+    dequant8_tm(q2.x, sc2, b + 0);
+    dequant8_tm(q2.y, sc2, b + 4);
+    const unsigned *B = reinterpret_cast<const unsigned *>(b);
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      const int rr = r + (t << 3);
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (rr < M) {
+        const half *xrow = x + (size_t)rr * K;
+        a01 = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+      }
+      const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01);
+      const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23);
+      MMA_8N8K4(c[t][0], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t][1 % NACC], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t][2 % NACC], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t][3 % NACC], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int a = 1; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][0][i] += c[t][a][i];
+
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t << 8) + row * 32 + qp * 8 + col] = c[t][0][i];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < MT * 256; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < SPLITK; w++) v += cs[w][e];
+    const int t = e >> 8, rem = e & 255;
+    const int row = (rem >> 5) + (t << 3), col = rem & 31;
+    if (row < M)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
+torch::Tensor skinny_gemm_qpn2_mt(torch::Tensor x, torch::Tensor qcodes,
+                                  torch::Tensor qscales, double gscale,
+                                  int64_t n, int64_t splitk, int64_t nacc,
+                                  int64_t mt) {
+  const int64_t m = x.size(0), k = x.size(1);
+  TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
+  TORCH_CHECK(qcodes.is_cuda() && qcodes.dtype() == torch::kUInt8 &&
+              qcodes.is_contiguous());
+  TORCH_CHECK(qscales.is_cuda() && qscales.dtype() == torch::kUInt8 &&
+              qscales.is_contiguous());
+  TORCH_CHECK(mt == 2 || mt == 4, "qpn2_mt: mt in {2,4}");
+  TORCH_CHECK(m >= 1 && m <= 8 * mt, "qpn2_mt supports M 1..8*mt, got ", m);
+  TORCH_CHECK(k % 64 == 0 && (k / 16) % splitk == 0, "K/SPLITK");
+  TORCH_CHECK(n % 32 == 0, "N % 32");
+  TORCH_CHECK(qcodes.numel() == n * (k >> 1), "qpn codes size");
+  TORCH_CHECK(qscales.numel() == n * (k >> 4), "qpn scales size");
+  auto y = torch::empty({m, n}, x.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_QPN2MT(SPv, NAv, MTv)                                          \
+  skinny_nvfp4_qpn2_mt<SPv, NAv, MTv>                                         \
+      <<<dim3((int)(n / 32)), dim3(32 * SPv), 0, stream>>>(                   \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),            \
+          reinterpret_cast<const half *>(x.data_ptr<at::Half>()),             \
+          reinterpret_cast<half *>(y.data_ptr<at::Half>()), (int)n,           \
+          (int)k, (int)m, (float)gscale)
+
+  const int key = (int)(mt * 1000 + splitk * 10 + nacc);
+  switch (key) {
+    case 2081: LAUNCH_QPN2MT(8, 1, 2); break;
+    case 2082: LAUNCH_QPN2MT(8, 2, 2); break;
+    case 2161: LAUNCH_QPN2MT(16, 1, 2); break;
+    case 2162: LAUNCH_QPN2MT(16, 2, 2); break;
+    case 4041: LAUNCH_QPN2MT(4, 1, 4); break;
+    case 4042: LAUNCH_QPN2MT(4, 2, 4); break;
+    case 4081: LAUNCH_QPN2MT(8, 1, 4); break;
+    case 4082: LAUNCH_QPN2MT(8, 2, 4); break;
+    default:
+      TORCH_CHECK(false, "qpn2_mt: mt=2 takes splitk {8,16}, mt=4 takes "
+                         "splitk {4,8}; nacc in {1,2}");
+  }
+#undef LAUNCH_QPN2MT
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+
+// ---------------------------------------------------------------------------
+// QPN2 MTT (2026-09-05, experimental): MT row-tiles x T N-tiles per warp.
+// Hypothesis under test: qpn2's per-row cost above 8 rows is A (activation)
+// re-read traffic -- every N-tile CTA streams the whole x through L2, which
+// equals the weight traffic at M=8 and doubles with M -- not the m8n8k4
+// issue rate. Each warp here owns T adjacent N-tiles and loads the A
+// fragments ONCE per k-group for all of them, cutting A traffic by T.
+// Split-K partials are staged in dynamic shared memory
+// (SPLITK * T * MT KB, deterministic reduction, <= 96 KB on sm_70).
+template <int SPLITK, int NACC, int MT, int T>
+__global__ void __launch_bounds__(32 * SPLITK)
+skinny_nvfp4_qpn2_mtt(const uint8_t *__restrict__ bcodes,
+                      const uint8_t *__restrict__ bscales,
+                      const half *__restrict__ x, half *__restrict__ y,
+                      int N, int K, int M, float gscale) {
+  extern __shared__ float cs_dyn[];  // [SPLITK][T*MT*256]
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile0 = blockIdx.x * T;
+  const int ntiles = N >> 5;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq;
+  const half2 gm2 = __float2half2_rn(gscale * 16384.f);
+
+  const uint2 *cb[T];
+  const uint8_t *sb[T];
+#pragma unroll
+  for (int t = 0; t < T; t++) {
+    const int tile = min(tile0 + t, ntiles - 1);
+    cb[t] = reinterpret_cast<const uint2 *>(bcodes) + (size_t)tile * G * 32 + lane;
+    sb[t] = bscales + (size_t)tile * G * 32 + lane;
+  }
+
+  float c[T][MT][NACC][8];
+#pragma unroll
+  for (int t = 0; t < T; t++)
+#pragma unroll
+    for (int u = 0; u < MT; u++)
+#pragma unroll
+      for (int a = 0; a < NACC; a++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) c[t][u][a][i] = 0.f;
+
+#pragma unroll 2
+  for (int g = g0; g < g0 + Gq; g++) {
+    uint4 a01[MT], a23[MT];
+#pragma unroll
+    for (int u = 0; u < MT; u++) {
+      const int rr = r + (u << 3);
+      a01[u] = make_uint4(0, 0, 0, 0); a23[u] = make_uint4(0, 0, 0, 0);
+      if (rr < M) {
+        const half *xrow = x + (size_t)rr * K;
+        a01[u] = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+        a23[u] = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+      }
+    }
+    uint2 q2[T]; unsigned sc[T];
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+      q2[t] = __ldcs(cb[t] + (size_t)g * 32);
+      sc[t] = __ldg(sb[t] + (size_t)g * 32);
+    }
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+      const half2 sc2 = __hmul2(fp8e4m3_to_half2(sc[t]), gm2);
+      half2 b[8];
+      dequant8_tm(q2[t].x, sc2, b + 0);
+      dequant8_tm(q2[t].y, sc2, b + 4);
+      const unsigned *B = reinterpret_cast<const unsigned *>(b);
+#pragma unroll
+      for (int u = 0; u < MT; u++) {
+        const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01[u]);
+        const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23[u]);
+        MMA_8N8K4(c[t][u][0], A0[0], A0[1], B[0], B[1]);
+        MMA_8N8K4(c[t][u][1 % NACC], A0[2], A0[3], B[2], B[3]);
+        MMA_8N8K4(c[t][u][2 % NACC], A1[0], A1[1], B[4], B[5]);
+        MMA_8N8K4(c[t][u][3 % NACC], A1[2], A1[3], B[6], B[7]);
+      }
+    }
+  }
+
+  float *cs = cs_dyn + (size_t)warp * (T * MT * 256);
+#pragma unroll
+  for (int t = 0; t < T; t++)
+#pragma unroll
+    for (int u = 0; u < MT; u++) {
+#pragma unroll
+      for (int a = 1; a < NACC; a++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) c[t][u][0][i] += c[t][u][a][i];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        cs[(t * MT + u) * 256 + row * 32 + qp * 8 + col] = c[t][u][0][i];
+      }
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < T * MT * 256; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < SPLITK; w++) v += cs_dyn[(size_t)w * (T * MT * 256) + e];
+    const int t = e / (MT * 256), rem = e % (MT * 256);
+    const int u = rem >> 8, rem2 = rem & 255;
+    const int row = (rem2 >> 5) + (u << 3), col = rem2 & 31;
+    const int tile = tile0 + t;
+    if (row < M && tile < ntiles)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
+torch::Tensor skinny_gemm_qpn2_mtt(torch::Tensor x, torch::Tensor qcodes,
+                                   torch::Tensor qscales, double gscale,
+                                   int64_t n, int64_t splitk, int64_t nacc,
+                                   int64_t mt, int64_t tt) {
+  const int64_t m = x.size(0), k = x.size(1);
+  TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
+  TORCH_CHECK(qcodes.is_cuda() && qcodes.dtype() == torch::kUInt8 && qcodes.is_contiguous());
+  TORCH_CHECK(qscales.is_cuda() && qscales.dtype() == torch::kUInt8 && qscales.is_contiguous());
+  TORCH_CHECK(m >= 1 && m <= 8 * mt, "qpn2_mtt: M 1..8*mt");
+  TORCH_CHECK(k % 64 == 0 && (k / 16) % splitk == 0, "K/SPLITK");
+  TORCH_CHECK(n % 32 == 0, "N % 32");
+  auto y = torch::empty({m, n}, x.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t ntiles = n / 32, grid = (ntiles + tt - 1) / tt;
+  const size_t smem = (size_t)splitk * tt * mt * 256 * sizeof(float);
+  TORCH_CHECK(smem <= 96 * 1024, "qpn2_mtt: staging buffer ", smem, " > 96 KB");
+
+#define LAUNCH_MTT(SPv, NAv, MTv, Tv)                                          \
+  do {                                                                         \
+    auto kfn = skinny_nvfp4_qpn2_mtt<SPv, NAv, MTv, Tv>;                       \
+    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,     \
+                         (int)smem);                                           \
+    kfn<<<dim3((int)grid), dim3(32 * SPv), smem, stream>>>(                    \
+        qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),               \
+        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),                \
+        reinterpret_cast<half *>(y.data_ptr<at::Half>()), (int)n, (int)k,      \
+        (int)m, (float)gscale);                                                \
+  } while (0)
+
+  const int key = (int)(tt * 10000 + mt * 1000 + splitk * 10 + nacc);
+  switch (key) {
+    // T=2
+    case 22081: LAUNCH_MTT(8, 1, 2, 2); break;
+    case 22161: LAUNCH_MTT(16, 1, 2, 2); break;
+    case 22162: LAUNCH_MTT(16, 2, 2, 2); break;
+    case 24081: LAUNCH_MTT(8, 1, 4, 2); break;
+    case 24082: LAUNCH_MTT(8, 2, 4, 2); break;
+    case 22082: LAUNCH_MTT(8, 2, 2, 2); break;
+    case 21161: LAUNCH_MTT(16, 1, 1, 2); break;
+    case 21162: LAUNCH_MTT(16, 2, 1, 2); break;
+    // T=4
+    case 42081: LAUNCH_MTT(8, 1, 2, 4); break;
+    case 42082: LAUNCH_MTT(8, 2, 2, 4); break;
+    case 42161: LAUNCH_MTT(16, 1, 2, 4); break;
+    case 44041: LAUNCH_MTT(4, 1, 4, 4); break;
+    case 44081: LAUNCH_MTT(8, 1, 4, 4); break;
+    case 41161: LAUNCH_MTT(16, 1, 1, 4); break;
+    case 41162: LAUNCH_MTT(16, 2, 1, 4); break;
+    case 41081: LAUNCH_MTT(8, 1, 1, 4); break;
+    // T=8
+    case 82081: LAUNCH_MTT(8, 1, 2, 8); break;
+    case 81161: LAUNCH_MTT(16, 1, 1, 8); break;
+    case 81081: LAUNCH_MTT(8, 1, 1, 8); break;
+    case 84041: LAUNCH_MTT(4, 1, 4, 8); break;
+    default: TORCH_CHECK(false, "qpn2_mtt: unsupported (tt,mt,splitk,nacc) = ", tt, ",", mt, ",", splitk, ",", nacc);
+  }
+#undef LAUNCH_MTT
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+
+// ---------------------------------------------------------------------------
+// QPN8 MTT (2026-09-05): the FP8 twin of skinny_nvfp4_qpn2_mtt -- MT row-tiles
+// x T N-tiles per warp, A fragments loaded once per k-group for all T tiles.
+// Same rationale (A re-read traffic, not mma issue, bounds the m8n8k4 loop
+// above 8 rows). Split-K partials staged in dynamic shared memory
+// (SPLITK * T * MT KB <= 96 KB), reduced in warp order -> deterministic and,
+// for equal (SPLITK, NACC), bit-identical per row to skinny_fp8_qpn8.
+template <int SPLITK, int NACC, int MT, int T, bool FASTDEC = false>
+__global__ void __launch_bounds__(32 * SPLITK)
+skinny_fp8_qpn8_mtt(const uint8_t *__restrict__ bcodes,
+                    const float *__restrict__ tscale,
+                    const half *__restrict__ x, half *__restrict__ y,
+                    int N, int K, int M) {
+  extern __shared__ float cs_dyn[];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile0 = blockIdx.x * T;
+  const int ntiles = N >> 5;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq;
+
+  const uint4 *cb[T];
+  float ws[T];
+#pragma unroll
+  for (int t = 0; t < T; t++) {
+    const int tile = min(tile0 + t, ntiles - 1);
+    cb[t] = reinterpret_cast<const uint4 *>(bcodes) + (size_t)tile * G * 32 + lane;
+    ws[t] = __ldg(tscale + tile);
+  }
+
+  float c[T][MT][NACC][8];
+#pragma unroll
+  for (int t = 0; t < T; t++)
+#pragma unroll
+    for (int u = 0; u < MT; u++)
+#pragma unroll
+      for (int a = 0; a < NACC; a++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) c[t][u][a][i] = 0.f;
+
+#pragma unroll 2
+  for (int g = g0; g < g0 + Gq; g++) {
+    uint4 a01[MT], a23[MT];
+#pragma unroll
+    for (int u = 0; u < MT; u++) {
+      const int rr = r + (u << 3);
+      a01[u] = make_uint4(0, 0, 0, 0); a23[u] = make_uint4(0, 0, 0, 0);
+      if (rr < M) {
+        const half *xrow = x + (size_t)rr * K;
+        a01[u] = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+        a23[u] = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+      }
+    }
+    uint4 q4[T];
+#pragma unroll
+    for (int t = 0; t < T; t++) q4[t] = __ldcs(cb[t] + (size_t)g * 32);
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+      half2 b[8];
+      if (FASTDEC) {
+        fp8x8_to_half2x4_fast(make_uint2(q4[t].x, q4[t].y), b + 0);
+        fp8x8_to_half2x4_fast(make_uint2(q4[t].z, q4[t].w), b + 4);
+      } else {
+        fp8x8_to_half2x4(make_uint2(q4[t].x, q4[t].y), b + 0);
+        fp8x8_to_half2x4(make_uint2(q4[t].z, q4[t].w), b + 4);
+      }
+      const unsigned *B = reinterpret_cast<const unsigned *>(b);
+#pragma unroll
+      for (int u = 0; u < MT; u++) {
+        const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01[u]);
+        const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23[u]);
+        MMA_8N8K4(c[t][u][0], A0[0], A0[1], B[0], B[1]);
+        MMA_8N8K4(c[t][u][1 % NACC], A0[2], A0[3], B[2], B[3]);
+        MMA_8N8K4(c[t][u][2 % NACC], A1[0], A1[1], B[4], B[5]);
+        MMA_8N8K4(c[t][u][3 % NACC], A1[2], A1[3], B[6], B[7]);
+      }
+    }
+  }
+
+  float *cs = cs_dyn + (size_t)warp * (T * MT * 256);
+#pragma unroll
+  for (int t = 0; t < T; t++)
+#pragma unroll
+    for (int u = 0; u < MT; u++) {
+#pragma unroll
+      for (int a = 1; a < NACC; a++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) c[t][u][0][i] += c[t][u][a][i];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        cs[(t * MT + u) * 256 + row * 32 + qp * 8 + col] = c[t][u][0][i];
+      }
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < T * MT * 256; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < SPLITK; w++) v += cs_dyn[(size_t)w * (T * MT * 256) + e];
+    const int t = e / (MT * 256), rem = e % (MT * 256);
+    const int u = rem >> 8, rem2 = rem & 255;
+    const int row = (rem2 >> 5) + (u << 3), col = rem2 & 31;
+    const int tile = tile0 + t;
+    if (row < M && tile < ntiles)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v * ws[t]);
+  }
+}
+
+torch::Tensor skinny_gemm_qpn8_mtt(torch::Tensor x, torch::Tensor qcodes,
+                                   torch::Tensor tscale, int64_t n,
+                                   int64_t splitk, int64_t nacc, int64_t mt,
+                                   int64_t tt) {
+  const int64_t m = x.size(0), k = x.size(1);
+  TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
+  TORCH_CHECK(qcodes.is_cuda() && qcodes.dtype() == torch::kUInt8 && qcodes.is_contiguous());
+  TORCH_CHECK(tscale.is_cuda() && tscale.dtype() == torch::kFloat && tscale.is_contiguous());
+  TORCH_CHECK(m >= 1 && m <= 8 * mt, "qpn8_mtt: M 1..8*mt");
+  TORCH_CHECK(k % 64 == 0 && (k / 16) % splitk == 0, "K/SPLITK");
+  TORCH_CHECK(n % 32 == 0, "N % 32");
+  TORCH_CHECK(qcodes.numel() == n * k, "qpn8 codes size");
+  auto y = torch::empty({m, n}, x.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t ntiles = n / 32, grid = (ntiles + tt - 1) / tt;
+  const size_t smem = (size_t)splitk * tt * mt * 256 * sizeof(float);
+  TORCH_CHECK(smem <= 96 * 1024, "qpn8_mtt: staging buffer ", smem, " > 96 KB");
+  // nacc carries +2 to select the fast decoder (same convention as
+  // skinny_gemm_qpn8 / _mt2): 1,2 = scalar decoder; 3,4 = fast decoder with
+  // nacc 1,2. Both decoders are exact, so the choice is speed only.
+  const bool fast = nacc >= 3;
+  const int64_t nacc_eff = fast ? nacc - 2 : nacc;
+
+#define LAUNCH_Q8MTT(SPv, NAv, MTv, Tv, Fv)                                    \
+  do {                                                                         \
+    auto kfn = skinny_fp8_qpn8_mtt<SPv, NAv, MTv, Tv, Fv>;                     \
+    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,     \
+                         (int)smem);                                           \
+    kfn<<<dim3((int)grid), dim3(32 * SPv), smem, stream>>>(                    \
+        qcodes.data_ptr<uint8_t>(), tscale.data_ptr<float>(),                  \
+        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),                \
+        reinterpret_cast<half *>(y.data_ptr<at::Half>()), (int)n, (int)k,      \
+        (int)m);                                                               \
+  } while (0)
+#define LAUNCH_Q8MTT_F(SPv, NAv, MTv, Tv)                                      \
+  do { if (fast) LAUNCH_Q8MTT(SPv, NAv, MTv, Tv, true);                        \
+       else LAUNCH_Q8MTT(SPv, NAv, MTv, Tv, false); } while (0)
+
+  const int key = (int)(tt * 10000 + mt * 1000 + splitk * 10 + nacc_eff);
+  switch (key) {
+    case 22041: LAUNCH_Q8MTT_F(4, 1, 2, 2); break;
+    case 22042: LAUNCH_Q8MTT_F(4, 2, 2, 2); break;
+    case 22081: LAUNCH_Q8MTT_F(8, 1, 2, 2); break;
+    case 22082: LAUNCH_Q8MTT_F(8, 2, 2, 2); break;
+    case 22161: LAUNCH_Q8MTT_F(16, 1, 2, 2); break;
+    case 22162: LAUNCH_Q8MTT_F(16, 2, 2, 2); break;
+    case 24041: LAUNCH_Q8MTT_F(4, 1, 4, 2); break;
+    case 24042: LAUNCH_Q8MTT_F(4, 2, 4, 2); break;
+    case 24081: LAUNCH_Q8MTT_F(8, 1, 4, 2); break;
+    case 24082: LAUNCH_Q8MTT_F(8, 2, 4, 2); break;
+    default: TORCH_CHECK(false, "qpn8_mtt: unsupported (tt,mt,splitk,nacc) = ", tt, ",", mt, ",", splitk, ",", nacc);
+  }
+#undef LAUNCH_Q8MTT_F
+#undef LAUNCH_Q8MTT
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_qpn8", &skinny_gemm_qpn8,
         "skinny FP8 E4M3 GEMM (QPN8, M<=8)");
@@ -2345,6 +3029,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "M<=16)");
   m.def("gemm_qpn2", &skinny_gemm_qpn2,
         "skinny NVFP4 GEMM (QP-N geometry winner, M<=8)");
+  m.def("gemm_qpn2_mtt", &skinny_gemm_qpn2_mtt,
+        "skinny NVFP4 GEMM: qpn2 with MT row-tiles x T N-tiles per warp "
+        "(A fragments reused across tiles; M 9..32 band, 1.25-1.5x the "
+        "8-row cost instead of 2x)");
+  m.def("gemm_qpn8_mtt", &skinny_gemm_qpn8_mtt,
+        "skinny FP8 E4M3 GEMM: qpn8 with MT row-tiles x T N-tiles per warp");
+  m.def("gemm_qpn2_mt", &skinny_gemm_qpn2_mt,
+        "skinny NVFP4 GEMM (QPN2 with MT row-tiles against one weight "
+        "stream: mt=2 -> M<=16, mt=4 -> M<=32)");
   m.def("gemm_qpn", &skinny_gemm_qpn,
         "skinny NVFP4 GEMM (QP-N mma.m8n8k4, prepacked weights, M<=16)");
   m.def("gemm_qpn_simt", &skinny_gemm_qpn_simt,
@@ -2368,6 +3061,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("qpn_dequant", &skinny_qpn_dequant,
         "fused unprepack+dequant: qpn buffer -> dense fp16 [n,k] (transient "
         "prefill weight for a dense cuBLAS GEMM)");
+  m.def("qpn8_dequant", &skinny_qpn8_dequant,
+        "fused unprepack+dequant: qpn8 buffer -> dense fp16 [n,k] (transient "
+        "FP8 prefill weight for a dense cuBLAS GEMM)");
+  m.def("gemv_f16", &skinny_gemv_f16,
+        "small-N fp16 GEMV (M<=16): x[M,K] * w[N,K]^T, fp32 accumulate");
+  m.def("gdn_split3", &skinny_gdn_split3,
+        "GDN q/k/v split: strided [M, q+k+v] -> three contiguous tensors in one launch");
   m.def("qpn_unprepack", &skinny_qpn_unprepack,
         "inverse of the host _qpn_prepack permutation: qpn buffer -> "
         "checkpoint-native (codes, scales), pure byte shuffle");
